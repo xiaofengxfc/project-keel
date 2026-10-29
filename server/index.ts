@@ -150,7 +150,7 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
   }
 })
 
-app.post<{ Body: { question: string; context: { symbol: string; interval: string; price: number | null; lines: Array<{ label: string; price: number }> } } }>('/api/assistant', async (request, reply) => {
+app.post<{ Body: { question: string; context: { symbol: string; interval: string; price: number | null; analysis?: { environment: string; direction: string; status: string; entry: number | null; support: number | null; resistance: number | null; stopLoss: number | null; takeProfit: number | null; riskReward: number | null }; lines: Array<{ label: string; price: number }> } } }>('/api/assistant', async (request, reply) => {
   if (!aiModel || !aiBaseUrl) return reply.code(503).send({ error: '本地服务器尚未配置 OpenAI 兼容 AI 服务。' })
   const question = request.body?.question?.trim()
   if (!question) return reply.code(400).send({ error: '请输入问题' })
@@ -188,7 +188,7 @@ app.delete<{ Querystring: { symbol?: string; orderId?: string } }>('/api/order',
   }
 })
 
-app.listen({ port: Number(process.env.PORT ?? 8787), host: '127.0.0.1' }).catch((error) => {
+app.listen({ port: Number(process.env.PORT ?? 8788), host: '127.0.0.1' }).catch((error) => {
   app.log.error(error)
   process.exit(1)
 })
