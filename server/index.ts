@@ -10,7 +10,8 @@ const baseUrl = process.env.BINANCE_FUTURES_BASE_URL ?? 'https://fapi.binance.co
 const tradingEnabled = process.env.TRADING_ENABLED === 'true'
 const aiKey = process.env.OPENAI_API_KEY ?? ''
 const aiModel = process.env.OPENAI_MODEL ?? ''
-const aiBaseUrl = (process.env.OPENAI_API_BASE ?? 'https://api.openai.com/v1').replace(/\/$/, '')
+const aiBaseUrl = (process.env.OPENAI_API_BASE ?? process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, '')
+const aiChatUrl = aiBaseUrl.endsWith('/chat/completions') ? aiBaseUrl : `${aiBaseUrl}/chat/completions`
 
 await app.register(cors, {
   origin: process.env.APP_ORIGIN ?? 'http://localhost:5173',
@@ -44,7 +45,8 @@ app.get('/api/health', async () => ({
   ok: true,
   privateApiConfigured: Boolean(apiKey && apiSecret),
   tradingEnabled,
-  aiConfigured: Boolean(aiKey && aiModel),
+  aiConfigured: Boolean(aiModel && aiBaseUrl),
+  publicMarketAvailable: true,
   environment: 'binance-usdm-futures',
 }))
 
@@ -58,6 +60,14 @@ app.get<{ Querystring: { symbol?: string; interval?: string; limit?: string } }>
     return await binanceRequest('GET', '/fapi/v1/klines', { symbol, interval, limit })
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 行情失败' })
+  }
+})
+
+app.get('/api/market/tickers', async (_request, reply) => {
+  try {
+    return await binanceRequest('GET', '/fapi/v1/ticker/24hr')
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 公共行情失败' })
   }
 })
 
@@ -131,14 +141,16 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
 })
 
 app.post<{ Body: { question: string; context: { symbol: string; interval: string; price: number | null; lines: Array<{ label: string; price: number }> } } }>('/api/assistant', async (request, reply) => {
-  if (!aiKey || !aiModel) return reply.code(503).send({ error: '本地服务器尚未配置 AI 服务。' })
+  if (!aiModel || !aiBaseUrl) return reply.code(503).send({ error: '本地服务器尚未配置 OpenAI 兼容 AI 服务。' })
   const question = request.body?.question?.trim()
   if (!question) return reply.code(400).send({ error: '请输入问题' })
   const context = request.body.context
   try {
-    const response = await fetch(`${aiBaseUrl}/chat/completions`, {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (aiKey) headers.Authorization = `Bearer ${aiKey}`
+    const response = await fetch(aiChatUrl, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${aiKey}`, 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         model: aiModel,
         messages: [
