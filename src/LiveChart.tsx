@@ -15,22 +15,25 @@ type Props = {
   onAddLevel: (price: number) => void
   onAddTrend: (start: Trend['start'], end: Trend['end']) => void
   onRemoveLevel: (id: number) => void
+  onLoadOlder: () => void
 }
 
-export default function LiveChart({ data, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel }: Props) {
+export default function LiveChart({ data, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const priceLineRef = useRef<Map<number, IPriceLine>>(new Map())
   const pendingTrend = useRef<Trend['start'] | null>(null)
+  const previousData = useRef<Candle[]>([])
+  const hasInitializedData = useRef(false)
   const toolRef = useRef(tool)
   const levelLabelRef = useRef(levelLabel)
-  const callbacks = useRef({ onAddLevel, onAddTrend, onRemoveLevel })
+  const callbacks = useRef({ onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder })
   const [revision, setRevision] = useState(0)
   const [size, setSize] = useState({ width: 0, height: 0 })
   toolRef.current = tool
   levelLabelRef.current = levelLabel
-  callbacks.current = { onAddLevel, onAddTrend, onRemoveLevel }
+  callbacks.current = { onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder }
 
   useEffect(() => {
     const element = host.current
@@ -77,7 +80,12 @@ export default function LiveChart({ data, levels, trends, tool, levelLabel, onAd
     chart.subscribeClick(clickHandler)
     chart.subscribeDblClick(doubleClickHandler)
     const redraw = () => setRevision((value) => value + 1)
-    chart.timeScale().subscribeVisibleLogicalRangeChange(redraw)
+    const onVisibleRangeChange = () => {
+      redraw()
+      const range = chart.timeScale().getVisibleLogicalRange()
+      if (hasInitializedData.current && range && range.from < 24) callbacks.current.onLoadOlder()
+    }
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleRangeChange)
     const observer = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect
       if (rect) setSize({ width: rect.width, height: rect.height })
@@ -86,7 +94,7 @@ export default function LiveChart({ data, levels, trends, tool, levelLabel, onAd
     observer.observe(element)
     return () => {
       observer.disconnect()
-      chart.timeScale().unsubscribeVisibleLogicalRangeChange(redraw)
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
       chart.unsubscribeClick(clickHandler)
       chart.unsubscribeDblClick(doubleClickHandler)
       chart.remove()
@@ -98,8 +106,38 @@ export default function LiveChart({ data, levels, trends, tool, levelLabel, onAd
   useEffect(() => {
     const series = seriesRef.current
     if (!series) return
-    series.setData(data.map((candle) => ({ ...candle, time: candle.time as Time })))
-    if (data.length) chartRef.current?.timeScale().fitContent()
+    const chart = chartRef.current
+    const previous = previousData.current
+    if (!data.length) {
+      series.setData([])
+      previousData.current = []
+      hasInitializedData.current = false
+      return
+    }
+    const previousFirstTime = previous[0]?.time
+    const firstTime = data[0]?.time
+    const previousLastTime = previous[previous.length - 1]?.time
+    const last = data[data.length - 1]
+
+    if (previous.length && last && (data.length === previous.length && firstTime === previousFirstTime && last.time === previousLastTime || data.length === previous.length + 1 && firstTime === previousFirstTime && last.time > (previousLastTime ?? -Infinity))) {
+      series.update({ ...last, time: last.time as Time })
+    } else {
+      const visibleRange = chart?.timeScale().getVisibleLogicalRange()
+      let prependCount = 0
+      if (previous.length && previousFirstTime !== undefined && firstTime !== undefined && firstTime < previousFirstTime) {
+        prependCount = data.findIndex((candle) => candle.time === previousFirstTime)
+      }
+      series.setData(data.map((candle) => ({ ...candle, time: candle.time as Time })))
+      if (!previous.length && data.length) {
+        chart?.timeScale().setVisibleLogicalRange({ from: Math.max(0, data.length - 120), to: data.length + 4 })
+        hasInitializedData.current = true
+      } else if (visibleRange && prependCount > 0) {
+        chart?.timeScale().setVisibleLogicalRange({ from: visibleRange.from + prependCount, to: visibleRange.to + prependCount })
+      } else if (visibleRange) {
+        chart?.timeScale().setVisibleLogicalRange(visibleRange)
+      }
+    }
+    previousData.current = data
   }, [data])
 
   useEffect(() => {

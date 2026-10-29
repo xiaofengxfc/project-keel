@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api': 'http://localhost:8787',
+      '/api': process.env.KEEL_BACKEND_URL ?? 'http://localhost:8787',
     },
   },
 })

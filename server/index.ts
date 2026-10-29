@@ -50,14 +50,14 @@ app.get('/api/health', async () => ({
   environment: 'binance-usdm-futures',
 }))
 
-app.get<{ Querystring: { symbol?: string; interval?: string; limit?: string } }>('/api/market/klines', async (request, reply) => {
+app.get<{ Querystring: { symbol?: string; interval?: string; limit?: string; endTime?: string } }>('/api/market/klines', async (request, reply) => {
   const symbol = request.query.symbol?.toUpperCase()
   const interval = request.query.interval ?? '1h'
   const limit = Math.min(Number(request.query.limit ?? 150), 1000)
   if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: 'A valid symbol is required' })
   if (!['1m', '5m', '15m', '1h', '4h', '1d'].includes(interval)) return reply.code(400).send({ error: 'Unsupported interval' })
   try {
-    return await binanceRequest('GET', '/fapi/v1/klines', { symbol, interval, limit })
+    return await binanceRequest('GET', '/fapi/v1/klines', { symbol, interval, limit, endTime: request.query.endTime })
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 行情失败' })
   }
