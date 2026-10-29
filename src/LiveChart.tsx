@@ -8,6 +8,7 @@ type Tool = 'cursor' | 'horizontal' | 'trend'
 
 type Props = {
   data: Candle[]
+  livePrice: number | null
   levels: Level[]
   trends: Trend[]
   tool: Tool
@@ -18,11 +19,12 @@ type Props = {
   onLoadOlder: () => void
 }
 
-export default function LiveChart({ data, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder }: Props) {
+export default function LiveChart({ data, livePrice, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const priceLineRef = useRef<Map<number, IPriceLine>>(new Map())
+  const currentPriceLine = useRef<IPriceLine | null>(null)
   const pendingTrend = useRef<Trend['start'] | null>(null)
   const previousData = useRef<Candle[]>([])
   const hasInitializedData = useRef(false)
@@ -139,6 +141,17 @@ export default function LiveChart({ data, levels, trends, tool, levelLabel, onAd
     }
     previousData.current = data
   }, [data])
+
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series || livePrice === null) return
+    const line = currentPriceLine.current
+    if (line) {
+      line.applyOptions({ price: livePrice, title: '最新成交价' })
+    } else {
+      currentPriceLine.current = series.createPriceLine({ price: livePrice, color: '#2487e8', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '最新成交价' })
+    }
+  }, [livePrice])
 
   useEffect(() => {
     const series = seriesRef.current

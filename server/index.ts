@@ -71,6 +71,16 @@ app.get('/api/market/tickers', async (_request, reply) => {
   }
 })
 
+app.get<{ Querystring: { symbol?: string } }>('/api/market/ticker', async (request, reply) => {
+  const symbol = request.query.symbol?.toUpperCase()
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  try {
+    return await binanceRequest('GET', '/fapi/v1/ticker/24hr', { symbol })
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 实时行情失败' })
+  }
+})
+
 app.get('/api/market/exchange-info', async (_request, reply) => {
   try {
     return await binanceRequest('GET', '/fapi/v1/exchangeInfo')
