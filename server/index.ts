@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import 'dotenv/config'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
+import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols'
 
 const app = Fastify({ logger: true })
 const apiKey = process.env.BINANCE_API_KEY ?? ''
@@ -86,6 +87,20 @@ app.get('/api/market/exchange-info', async (_request, reply) => {
     return await binanceRequest('GET', '/fapi/v1/exchangeInfo')
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 交易规则失败' })
+  }
+})
+
+let cachedSymbols: { expiresAt: number; symbols: Array<{ symbol: string; baseAsset: string }> } | null = null
+
+app.get('/api/market/symbols', async (_request, reply) => {
+  if (cachedSymbols && cachedSymbols.expiresAt > Date.now()) return cachedSymbols.symbols
+  try {
+    const info = await binanceRequest<{ symbols: BinanceExchangeSymbol[] }>('GET', '/fapi/v1/exchangeInfo')
+    const symbols = tradableUsdtPerpetuals(info.symbols)
+    cachedSymbols = { expiresAt: Date.now() + 10 * 60 * 1000, symbols }
+    return symbols
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 合约列表失败' })
   }
 })
 
