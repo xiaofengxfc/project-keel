@@ -60,3 +60,23 @@
   .account-table th,.account-table td{padding:10px 11px}
   .order-content .order-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
+
+.watch-sort-hint{display:block;padding:0 16px 6px;color:#99a3ad;font-size:9px}
+.watch-item{gap:4px;padding:5px 3px;touch-action:pan-y}
+.watch-item.dragging{opacity:.55;background:#eef7f3;outline:1px dashed #15976c}
+.watch-item-main{display:flex;align-items:center;gap:9px;flex:1;min-width:0;padding:6px 5px;border:0;border-radius:7px;background:transparent;text-align:left}
+.watch-item-main:hover{background:#f4f7f8}
+.watch-item-main:disabled{cursor:default;opacity:.65}
+.watch-item-main .coin-name{min-width:0;overflow:hidden}
+.watch-item-main .coin-name small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.watch-drag-handle,.watch-favorite,.watch-order-actions button{flex:none;width:24px;height:30px;padding:0;border:0;border-radius:5px;background:transparent;color:#9ba5b0;font-size:16px}
+.watch-drag-handle{cursor:grab;touch-action:none;font-size:18px}
+.watch-drag-handle:active{cursor:grabbing}
+.watch-favorite{color:#a2acb6;font-size:19px}
+.watch-favorite.is-favorite{color:#d59b2b}
+.watch-order-actions{display:flex;flex-direction:column;gap:0}
+.watch-order-actions button{height:17px;font-size:12px;line-height:14px}
+.watch-order-actions button:disabled{opacity:.3;cursor:default}
+.watch-unavailable{opacity:.72}
+.chart-more-menu button:hover{background:#f3f6f7}
+@media(max-width:760px){.watch-item{gap:2px}.watch-drag-handle,.watch-favorite{width:27px}.watch-order-actions button{width:20px}}

@@ -1,15 +1,16 @@
 import crypto from 'node:crypto'
 import { isIP } from 'node:net'
 import 'dotenv/config'
-import Fastify from 'fastify'
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
 import { isMarketExecution, isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
+import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
 
 const app = Fastify({ logger: true })
-const apiKey = process.env.BINANCE_API_KEY ?? ''
-const apiSecret = process.env.BINANCE_API_SECRET ?? ''
-const baseUrl = process.env.BINANCE_FUTURES_BASE_URL ?? 'https://fapi.binance.com'
+const binanceConfig = getBinanceEnvironmentConfig(process.env.BINANCE_ENV, process.env.BINANCE_FUTURES_BASE_URL, process.env.BINANCE_FUTURES_WS_URL)
+const { apiKey, apiSecret } = getBinanceApiCredentials(binanceConfig.environment, process.env)
+const baseUrl = binanceConfig.restBaseUrl
 const tradingEnabled = process.env.TRADING_ENABLED === 'true'
 const aiKey = process.env.OPENAI_API_KEY ?? ''
 const aiModel = process.env.OPENAI_MODEL ?? ''
@@ -50,10 +51,11 @@ app.get('/api/health', async () => ({
   tradingEnabled,
   aiConfigured: Boolean(aiModel && aiBaseUrl),
   publicMarketAvailable: true,
-  environment: 'binance-usdm-futures',
+  environment: binanceConfig.environment,
+  websocketBaseUrl: binanceConfig.websocketBaseUrl,
 }))
 
-app.get('/api/network/ip', async (_request, reply) => {
+const detectCurrentIp = async (_request: FastifyRequest, reply: FastifyReply) => {
   const endpoints = ['https://checkip.amazonaws.com', 'https://api.ipify.org?format=json', 'https://ifconfig.me/ip', 'https://icanhazip.com']
   for (const endpoint of endpoints) {
     try {
@@ -65,8 +67,11 @@ app.get('/api/network/ip', async (_request, reply) => {
       if (isIP(address)) return { ip: address }
     } catch { /* 单个公网检测源不可用时，继续尝试备用源。 */ }
   }
-  return reply.code(502).send({ error: '公网 IP 检测源暂不可用，请稍后重试' })
-})
+  return reply.code(502).send({ error: '当前 IP 检测源暂不可用，请稍后重试' })
+}
+
+app.get('/api/network/ip', detectCurrentIp)
+app.get('/api/network/current-ip', detectCurrentIp)
 
 app.get<{ Querystring: { symbol?: string; interval?: string; limit?: string; endTime?: string } }>('/api/market/klines', async (request, reply) => {
   const symbol = request.query.symbol?.toUpperCase()

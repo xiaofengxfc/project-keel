@@ -2,28 +2,22 @@ import { startTransition, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import LiveChart from './LiveChart'
 import { analyzeMarket, analyzeMultipleTimeframes, type MarketAnalysis } from './marketAnalysis'
-import { tradableUsdtPerpetuals, type BinanceExchangeSymbol, type BinanceSymbolCatalogItem } from './binanceSymbols'
+import type { BinanceSymbolCatalogItem } from './binanceSymbols'
 import { isPriceOrder, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput, type BinanceOrderType } from './binanceOrders'
+import { parseWatchlist, reorderWatchlist, WATCHLIST_STORAGE_KEY } from './watchlist'
 import { DEFAULT_ANALYSIS_INDICATORS, DEFAULT_CHART_INDICATORS, type AnalysisIndicatorKey, type ChartIndicatorKey, calculateTechnicalIndicators } from './technicalIndicators'
 
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume?: number }
 type Tool = 'cursor' | 'horizontal' | 'trend'
 type Line = { id: number; price: number; label: string; color: string }
 type Trend = { id: number; start: { time: number; price: number }; end: { time: number; price: number } }
-type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean }
+type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; environment?: string; websocketBaseUrl?: string }
 type MarketQuote = { price: number; change: number }
 type Interval = '15m' | '1h' | '4h' | '1d'
 type PositionRow = { symbol: string; positionAmt: number; entryPrice: number; markPrice: number; unrealizedProfit: number; leverage: number; marginType: string; positionSide: string }
 type OrderRow = { orderId: number; symbol: string; side: string; type: string; price: number; stopPrice: number; origQty: number; executedQty: number; status: string; time: number; updateTime: number }
 
 type SymbolInfo = { symbol: string; name: string; icon: string; color: string }
-const defaultSymbols: SymbolInfo[] = [
-  { symbol: 'BTCUSDT', name: 'Bitcoin', icon: '₿', color: '#f7931a' },
-  { symbol: 'ETHUSDT', name: 'Ethereum', icon: '◆', color: '#627eea' },
-  { symbol: 'SOLUSDT', name: 'Solana', icon: '≋', color: '#8b5cf6' },
-  { symbol: 'BNBUSDT', name: 'BNB', icon: '◆', color: '#e8b923' },
-  { symbol: 'XRPUSDT', name: 'XRP', icon: '✕', color: '#111827' },
-]
 const intervals: Interval[] = ['15m', '1h', '4h', '1d']
 const chartIndicatorOptions: Array<{ key: ChartIndicatorKey; label: string }> = [
   { key: 'ema20', label: 'EMA 20' }, { key: 'ema50', label: 'EMA 50' }, { key: 'sma200', label: 'SMA 200' },
@@ -63,15 +57,9 @@ async function requestKlines(symbol: string, interval: Interval, endTime?: numbe
   if (endTime !== undefined) params.set('endTime', String(endTime))
   const query = params.toString()
   const request = (async () => {
-    try {
-      const response = await fetch(`https://fapi.binance.com/fapi/v1/klines?${query}`)
-      if (!response.ok) throw new Error(`Binance 行情请求失败：${response.status}`)
-      return await response.json() as unknown[][]
-    } catch {
-      const response = await fetch(`/api/market/klines?${query}`)
-      if (!response.ok) throw new Error(`Binance 行情请求失败：${response.status}`)
-      return await response.json() as unknown[][]
-    }
+    const response = await fetch(`/api/market/klines?${query}`)
+    if (!response.ok) throw new Error(`Binance 行情请求失败：${response.status}`)
+    return await response.json() as unknown[][]
   })()
   klineRequests.set(cacheKey, request)
   try {
@@ -93,9 +81,86 @@ function symbolVisual(baseAsset: string): Pick<SymbolInfo, 'icon' | 'color'> {
   return { icon: baseAsset.slice(0, 1) || '◆', color: palette[hash % palette.length] }
 }
 
+type MarketListProps = {
+  symbols: SymbolInfo[]
+  availableSymbols: SymbolInfo[]
+  favoriteSymbols: string[]
+  active: string
+  quotes: Record<string, MarketQuote>
+  search: string
+  loading: boolean
+  error: string
+  mobileOpen: boolean
+  onCloseMobile: () => void
+  onSearchChange: (value: string) => void
+  onSelect: (symbol: string) => void
+  onToggleFavorite: (symbol: string) => void
+  onMoveFavorite: (symbol: string, offset: -1 | 1) => void
+  onReorder: (from: string, over: string) => void
+}
+
+function MarketList({ symbols, availableSymbols, favoriteSymbols, active, quotes, search, loading, error, mobileOpen, onCloseMobile, onSearchChange, onSelect, onToggleFavorite, onMoveFavorite, onReorder }: MarketListProps) {
+  const dragRef = useRef<{ from: string; over: string } | null>(null)
+  const [dragging, setDragging] = useState<string | null>(null)
+  const showFavorites = search.trim().length === 0
+  const stopDrag = () => {
+    const drag = dragRef.current
+    if (drag && drag.from !== drag.over) onReorder(drag.from, drag.over)
+    dragRef.current = null
+    setDragging(null)
+  }
+  const handleDragStart = (event: React.PointerEvent<HTMLButtonElement>, symbol: string) => {
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    dragRef.current = { from: symbol, over: symbol }
+    setDragging(symbol)
+  }
+  const handleDragMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!dragRef.current) return
+    const element = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-watch-symbol]')
+    const over = element?.dataset.watchSymbol
+    if (over && favoriteSymbols.includes(over)) dragRef.current.over = over
+  }
+  const filteredRows = loading && !symbols.length
+    ? <div className="watch-empty">正在读取 Binance 交易对…</div>
+    : error && !symbols.length
+      ? <div className="watch-empty">{error}</div>
+      : symbols.length
+        ? symbols.map((item) => {
+          const favorite = favoriteSymbols.includes(item.symbol)
+          const available = availableSymbols.some((symbol) => symbol.symbol === item.symbol)
+          const quote = quotes[item.symbol]
+          const orderIndex = favoriteSymbols.indexOf(item.symbol)
+          return <div key={item.symbol} data-watch-symbol={item.symbol} className={`watch-item ${active === item.symbol ? 'active' : ''} ${dragging === item.symbol ? 'dragging' : ''} ${!available ? 'watch-unavailable' : ''}`}>
+            {showFavorites && <button type="button" className="watch-drag-handle" aria-label={`拖动排序 ${item.symbol}`} title="按住拖动排序" onPointerDown={(event) => handleDragStart(event, item.symbol)} onPointerMove={handleDragMove} onPointerUp={stopDrag} onPointerCancel={stopDrag}>⠿</button>}
+            <button type="button" className="watch-item-main" disabled={!available} onClick={() => { if (available) onSelect(item.symbol) }}>
+              <span className="coin-icon" style={{ background: item.color }}>{item.icon}</span>
+              <span className="coin-name"><b>{item.symbol.replace('USDT', '')}<small>/USDT</small></b><small>{available ? item.name : '当前 Binance 环境中不可用'}</small></span>
+              <span className="coin-price">{formatPrice(quote?.price ?? null)}<small className={quote && quote.change < 0 ? 'down' : 'up'}>{quote ? `${quote.change >= 0 ? '+' : ''}${quote.change.toFixed(2)}%` : '—'}</small></span>
+            </button>
+            {showFavorites && <div className="watch-order-actions"><button type="button" aria-label={`将 ${item.symbol} 上移`} disabled={orderIndex <= 0} onClick={() => onMoveFavorite(item.symbol, -1)}>↑</button><button type="button" aria-label={`将 ${item.symbol} 下移`} disabled={orderIndex < 0 || orderIndex >= favoriteSymbols.length - 1} onClick={() => onMoveFavorite(item.symbol, 1)}>↓</button></div>}
+            <button type="button" className={`watch-favorite ${favorite ? 'is-favorite' : ''}`} aria-label={favorite ? `取消收藏 ${item.symbol}` : `收藏 ${item.symbol}`} aria-pressed={favorite} onClick={() => onToggleFavorite(item.symbol)}>{favorite ? '★' : '☆'}</button>
+          </div>
+        })
+        : <div className="watch-empty">{showFavorites ? '暂无自选币种。搜索 Binance 交易对并点 ☆ 收藏。' : '没有匹配的 Binance USDT 永续合约'}</div>
+
+  return <>
+    {mobileOpen && <button type="button" className="mobile-market-backdrop" aria-label="关闭自选列表" onClick={onCloseMobile} />}
+    <aside className={`watchlist panel ${mobileOpen ? 'mobile-markets-open' : ''}`}>
+      <div className="panel-head"><div><span className="eyebrow">MARKETS</span><h2>自选行情</h2></div><button type="button" className="market-close" aria-label="关闭行情列表" onClick={onCloseMobile}>×</button></div>
+      <div className="search">⌕ <input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索 Binance USDT 永续" aria-label="搜索 Binance USDT 永续交易对" autoFocus={mobileOpen} /></div>
+      {showFavorites && favoriteSymbols.length > 1 && <small className="watch-sort-hint">按住 ⠿ 拖动排序，也可用箭头调整</small>}
+      <div className="watch-items">{filteredRows}</div>
+      <div className="watch-footer"><span>{showFavorites ? '搜索并收藏币种' : '仅显示可交易 USDT 永续'}</span><b>USⓈ-M Futures</b></div>
+    </aside>
+  </>
+}
+
 function App() {
-  const [active, setActive] = useState('BTCUSDT')
-  const [availableSymbols, setAvailableSymbols] = useState<SymbolInfo[]>(defaultSymbols)
+  const [watchlist, setWatchlist] = useState<string[]>(() => parseWatchlist(localStorage.getItem(WATCHLIST_STORAGE_KEY)))
+  const watchlistRef = useRef(watchlist)
+  const [active, setActive] = useState(() => parseWatchlist(localStorage.getItem(WATCHLIST_STORAGE_KEY))[0] ?? '')
+  const [availableSymbols, setAvailableSymbols] = useState<SymbolInfo[]>([])
   const [symbolCatalogLoading, setSymbolCatalogLoading] = useState(true)
   const [symbolCatalogError, setSymbolCatalogError] = useState('')
   const [price, setPrice] = useState<number | null>(null)
@@ -111,7 +176,7 @@ function App() {
   const [historyError, setHistoryError] = useState('')
   const [loadedMarketKey, setLoadedMarketKey] = useState('')
   const [connectedMarketKey, setConnectedMarketKey] = useState('')
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [tool, setTool] = useState<Tool>('cursor')
   const [analysisOpen, setAnalysisOpen] = useState(false)
   const [indicatorsOpen, setIndicatorsOpen] = useState(false)
@@ -179,38 +244,40 @@ function App() {
   const currentMarketKey = `${active}:${interval}`
   const connected = connectedMarketKey === currentMarketKey
   const marketDataIsCurrent = loadedMarketKey === currentMarketKey
-  const selected = availableSymbols.find((item) => item.symbol === active) ?? defaultSymbols[0]
+  const selected = availableSymbols.find((item) => item.symbol === active) ?? { symbol: active, name: '等待选择交易对', icon: '◆', color: '#5f6c7b' }
   const lines = storedLines[active] ?? defaultLines
   const trends = storedTrends[active] ?? []
   const filteredSymbols = useMemo(() => {
     const query = symbolSearch.trim().toLowerCase()
-    if (!query) return defaultSymbols
+    if (!query) return watchlist.map((symbol) => availableSymbols.find((item) => item.symbol === symbol) ?? { symbol, name: '当前 Binance 环境中不可用', ...symbolVisual(symbol.replace(/USDT$/, '')) })
     const symbolQuery = query.replace(/[^a-z0-9]/g, '')
     return availableSymbols.filter((item) => (symbolQuery.length > 0 && item.symbol.toLowerCase().includes(symbolQuery)) || item.name.toLowerCase().includes(query))
-  }, [availableSymbols, symbolSearch])
+  }, [availableSymbols, symbolSearch, watchlist])
 
   useEffect(() => {
     fetch('/api/health').then((response) => response.ok ? response.json() as Promise<Health> : null).then((value) => value && setHealth(value)).catch(() => undefined)
   }, [])
 
+  useEffect(() => { watchlistRef.current = watchlist }, [watchlist])
+
+  useEffect(() => {
+    localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist))
+  }, [watchlist])
+
   useEffect(() => {
     let cancelled = false
     const loadSymbolCatalog = async (): Promise<BinanceSymbolCatalogItem[]> => {
-      try {
-        const response = await fetch('/api/market/symbols')
-        if (response.ok) return await response.json() as BinanceSymbolCatalogItem[]
-      } catch { /* 本地后端不可用时尝试读取 Binance 公共接口。 */ }
-      const direct = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo')
-      if (!direct.ok) throw new Error('无法读取 Binance 合约列表')
-      const payload = await direct.json() as { symbols?: BinanceExchangeSymbol[] }
-      return tradableUsdtPerpetuals(payload.symbols ?? [])
+      const response = await fetch('/api/market/symbols')
+      if (!response.ok) throw new Error('无法读取 Binance 合约列表')
+      return await response.json() as BinanceSymbolCatalogItem[]
     }
     void loadSymbolCatalog()
       .then((catalog) => {
         if (cancelled) return
-        const merged = new Map<string, SymbolInfo>(defaultSymbols.map((item) => [item.symbol, item]))
-        catalog.forEach(({ symbol, baseAsset }) => { if (!merged.has(symbol)) merged.set(symbol, { symbol, name: baseAsset, ...symbolVisual(baseAsset) }) })
-        setAvailableSymbols([...merged.values()])
+        const symbols = catalog.map(({ symbol, baseAsset }) => ({ symbol, name: baseAsset, ...symbolVisual(baseAsset) }))
+        const validSymbols = new Set(symbols.map((item) => item.symbol))
+        setAvailableSymbols(symbols)
+        setActive((current) => validSymbols.has(current) ? current : watchlistRef.current.find((symbol) => validSymbols.has(symbol)) ?? '')
         setSymbolCatalogError('')
       })
       .catch((error) => { if (!cancelled) setSymbolCatalogError(error instanceof Error ? error.message : '合约列表暂不可用') })
@@ -221,6 +288,37 @@ function App() {
   useEffect(() => { localStorage.setItem('keel-analysis-indicators', JSON.stringify(analysisIndicators)) }, [analysisIndicators])
   useEffect(() => { localStorage.setItem('keel-chart-indicators', JSON.stringify(chartIndicators)) }, [chartIndicators])
   useEffect(() => { localStorage.setItem('keel-analysis-enabled', String(analysisEnabled)) }, [analysisEnabled])
+
+  const toggleFavorite = (symbol: string) => {
+    if (watchlist.includes(symbol)) {
+      const next = watchlist.filter((item) => item !== symbol)
+      setWatchlist(next)
+      if (active === symbol) {
+        const nextActive = next.find((item) => availableSymbols.some((available) => available.symbol === item)) ?? ''
+        setActive(nextActive)
+        if (!nextActive) {
+          setPrice(null)
+          setChange(null)
+          setCandles([])
+          setAnalysisCandlesByInterval({})
+          setConnectedMarketKey('')
+          setLoadedMarketKey('')
+        }
+      }
+      return
+    }
+    setWatchlist((current) => current.includes(symbol) ? current : [...current, symbol])
+    if (!active) setActive(symbol)
+  }
+
+  const moveFavorite = (symbol: string, offset: -1 | 1) => {
+    const index = watchlist.indexOf(symbol)
+    const destination = index + offset
+    if (index < 0 || destination < 0 || destination >= watchlist.length) return
+    const next = [...watchlist]
+    ;[next[index], next[destination]] = [next[destination], next[index]]
+    setWatchlist(next)
+  }
 
   useEffect(() => {
     if (!mobileMarketsOpen) return
@@ -239,19 +337,14 @@ function App() {
   }, [analysisOpen, moreActionsOpen])
 
   useEffect(() => {
+    if (!active && watchlist.length === 0) return
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    const allowed = new Set(availableSymbols.map((item) => item.symbol))
+    const allowed = new Set([...watchlist, active].filter(Boolean))
     const loadQuotes = async () => {
-      try {
-        const response = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr')
-        if (!response.ok) throw new Error('公共行情请求失败')
-        return await response.json() as Array<{ symbol: string; lastPrice: string; priceChangePercent: string }>
-      } catch {
-        const response = await fetch('/api/market/tickers')
-        if (!response.ok) throw new Error('公共行情请求失败')
-        return await response.json() as Array<{ symbol: string; lastPrice: string; priceChangePercent: string }>
-      }
+      const response = await fetch('/api/market/tickers')
+      if (!response.ok) throw new Error('公共行情请求失败')
+      return await response.json() as Array<{ symbol: string; lastPrice: string; priceChangePercent: string }>
     }
     const refreshQuotes = async () => {
       try {
@@ -269,9 +362,10 @@ function App() {
     }
     void refreshQuotes()
     return () => { cancelled = true; if (timer) clearTimeout(timer) }
-  }, [availableSymbols])
+  }, [active, watchlist])
 
   useEffect(() => {
+    if (!active) return
     const requestId = ++historyRequestId.current
     let cancelled = false
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
@@ -309,11 +403,12 @@ function App() {
       .catch(() => { if (!cancelled) setCandles([]) })
       .finally(() => { if (!cancelled) setLoading(false) })
 
-    const streams = defaultSymbols.map((item) => `${item.symbol.toLowerCase()}@ticker`)
+      const streams = watchlist.filter((symbol) => availableSymbols.some((item) => item.symbol === symbol)).map((symbol) => `${symbol.toLowerCase()}@ticker`)
     if (!streams.includes(`${active.toLowerCase()}@ticker`)) streams.push(`${active.toLowerCase()}@ticker`)
-    const streamUrl = `wss://fstream.binance.com/stream?streams=${[...streams, `${active.toLowerCase()}@kline_${interval}`].join('/')}`
+    const streamBaseUrl = health.websocketBaseUrl
+    const streamUrl = streamBaseUrl ? `${streamBaseUrl}/stream?streams=${[...streams, `${active.toLowerCase()}@kline_${interval}`].join('/')}` : ''
     const connect = () => {
-      if (cancelled) return
+      if (cancelled || !streamUrl) return
       socket = new WebSocket(streamUrl)
       socket.onopen = () => { reconnectAttempt = 0; if (!cancelled) setConnectedMarketKey(currentMarketKey) }
       socket.onmessage = (event) => {
@@ -348,10 +443,10 @@ function App() {
     }
     connect()
     return () => { cancelled = true; if (reconnectTimer) clearTimeout(reconnectTimer); socket?.close(); if (requestId === historyRequestId.current) historyRequestId.current += 1 }
-  }, [active, currentMarketKey, interval])
+  }, [active, availableSymbols, currentMarketKey, health.websocketBaseUrl, interval, watchlist])
 
   useEffect(() => {
-    if (!analysisEnabled) return
+    if (!analysisEnabled || !active) return
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
     const refreshAnalysisHistory = async () => {
@@ -367,22 +462,16 @@ function App() {
     return () => { cancelled = true; if (timer) clearTimeout(timer) }
   }, [active, analysisEnabled])
   useEffect(() => {
+    if (!active) return
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
 
     const refreshPrice = async () => {
       try {
         if (Date.now() - (tickerMessageAt.current[active] ?? 0) < 5000) return
-        let quote: { price?: string; lastPrice?: string; priceChangePercent?: string }
-        try {
-          const response = await fetch(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${active}`)
-          if (!response.ok) throw new Error('Binance 行情请求失败')
-          quote = await response.json() as typeof quote
-        } catch {
-          const response = await fetch(`/api/market/ticker?symbol=${active}`)
-          if (!response.ok) throw new Error('Binance 行情请求失败')
-          quote = await response.json() as typeof quote
-        }
+        const response = await fetch(`/api/market/ticker?symbol=${active}`)
+        if (!response.ok) throw new Error('Binance 行情请求失败')
+        const quote = await response.json() as { price?: string; lastPrice?: string; priceChangePercent?: string }
         const currentPrice = Number(quote.lastPrice ?? quote.price)
         if (!cancelled && Number.isFinite(currentPrice) && currentPrice > 0) {
           const currentChange = quote.priceChangePercent === undefined ? undefined : Number(quote.priceChangePercent)
@@ -454,8 +543,8 @@ function App() {
       const responses = await Promise.all([
         fetch('/api/account'),
         fetch('/api/positions'),
-        fetch(`/api/open-orders?symbol=${encodeURIComponent(active)}`),
-        fetch(`/api/order-history?symbol=${encodeURIComponent(active)}&limit=50`),
+        fetch(`/api/open-orders${active ? `?symbol=${encodeURIComponent(active)}` : ''}`),
+        active ? fetch(`/api/order-history?symbol=${encodeURIComponent(active)}&limit=50`) : Promise.resolve(null),
       ])
       return responses
     }).then(async (responses) => {
@@ -482,10 +571,13 @@ function App() {
         const rows = await openOrdersResponse.json() as OrderRow[]
         if (!cancelled) setOpenOrders(rows.map((row) => ({ ...row, price: Number(row.price), stopPrice: Number(row.stopPrice), origQty: Number(row.origQty), executedQty: Number(row.executedQty), time: Number(row.time), updateTime: Number(row.updateTime) })))
       } else { setOpenOrders([]); errors.push('当前委托') }
-      if (historyResponse.ok) {
+      if (historyResponse?.ok) {
         const rows = await historyResponse.json() as OrderRow[]
         if (!cancelled) setOrderHistory(rows.map((row) => ({ ...row, price: Number(row.price), stopPrice: Number(row.stopPrice), origQty: Number(row.origQty), executedQty: Number(row.executedQty), time: Number(row.time), updateTime: Number(row.updateTime) })).sort((left, right) => right.time - left.time))
-      } else { setOrderHistory([]); errors.push('历史订单') }
+      } else {
+        setOrderHistory([])
+        if (active) errors.push('历史订单')
+      }
       if (errors.length && !cancelled) setOrdersError(`${errors.join('、')}读取失败，请检查私有 API 权限后刷新`)
     }).catch(() => {
       if (!cancelled) setOrdersError('读取持仓与订单数据失败，请检查本地服务后刷新')
@@ -555,6 +647,7 @@ function App() {
   })
 
   const submitOrder = async () => {
+    if (!active) { setOrderMessage('请先搜索并选择一个 Binance 合约'); return }
     setOrderMessage('正在提交订单…')
     try {
       const oneWayPosition = positions.find((position) => position.symbol === active && position.positionSide === 'BOTH')
@@ -604,11 +697,11 @@ function App() {
     setIpLoading(true)
     setIpError('')
     try {
-      const response = await fetch('/api/network/ip')
+      const response = await fetch('/api/network/current-ip')
       const result = await response.json() as { ip?: string; error?: string }
-      if (!response.ok || !result.ip) throw new Error(result.error ?? '公网 IP 检测失败')
+      if (!response.ok || !result.ip) throw new Error(result.error ?? 'IP 检测失败')
       setPublicIp(result.ip)
-    } catch (error) { setIpError(error instanceof Error ? error.message : '公网 IP 检测失败') }
+    } catch (error) { setIpError(error instanceof Error ? error.message : 'IP 检测失败') }
     finally { setIpLoading(false) }
   }
 
@@ -670,12 +763,27 @@ function App() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><div className="brand-mark">K</div><div><strong>KEEL</strong><span>TRADING DESK</span></div></div>
-      <div className="top-actions"><div className={`connection ${connected ? 'online' : ''}`}><i />{connected ? 'Binance 永续已连接' : '正在连接 Binance'}</div><button type="button" className="icon-btn ip-check" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `公网 IP ${publicIp}` : '检测公网 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
+      <div className="top-actions"><div className={`connection ${connected ? 'online' : ''}`}><i />{connected ? `Binance ${health.environment === 'testnet' ? '测试网' : '正式网'} 已连接` : active ? '正在连接 Binance' : '请先收藏币种'}</div><button type="button" className="icon-btn ip-check" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `当前 IP ${publicIp}` : '检测 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
     </header>
     <main className="workspace">
-      {mobileMarketsOpen && <button type="button" className="mobile-market-backdrop" aria-label="关闭自选列表" onClick={() => setMobileMarketsOpen(false)} />}
-      <aside className={`watchlist panel ${mobileMarketsOpen ? 'mobile-markets-open' : ''}`}><div className="panel-head"><div><span className="eyebrow">MARKETS</span><h2>自选行情</h2></div><button type="button" className="market-close" aria-label="关闭行情列表" onClick={() => setMobileMarketsOpen(false)}>×</button></div><div className="search">⌕ <input value={symbolSearch} onChange={(event) => setSymbolSearch(event.target.value)} placeholder="搜索 Binance USDT 永续" aria-label="搜索 Binance USDT 永续交易对" autoFocus={mobileMarketsOpen} /></div><div className="watch-items">{symbolCatalogLoading && symbolSearch.trim() && <div className="watch-empty">正在读取 Binance 交易对…</div>}{!symbolCatalogLoading && symbolCatalogError && symbolSearch.trim() && <div className="watch-empty">{symbolCatalogError}</div>}{filteredSymbols.length ? filteredSymbols.map((item) => { const quote = marketQuotes[item.symbol]; return <button key={item.symbol} className={`watch-item ${active === item.symbol ? 'active' : ''}`} onClick={() => { if (item.symbol !== active) { if (autoTimeframe) { setInterval('1h'); setAutoTimeframeReady(false) } setOrderPrice(null); setStopPrice(''); setActivationPrice(''); setClosePosition(false); setActive(item.symbol) } setMobileMarketsOpen(false) }}><span className="coin-icon" style={{ background: item.color }}>{item.icon}</span><span className="coin-name"><b>{item.symbol.replace('USDT', '')}<small>/USDT</small></b><small>{item.name}</small></span><span className="coin-price">{formatPrice(quote?.price ?? null)}<small className={quote && quote.change < 0 ? 'down' : 'up'}>{quote ? `${quote.change >= 0 ? '+' : ''}${quote.change.toFixed(2)}%` : '—'}</small></span></button> }) : !symbolCatalogLoading && !symbolCatalogError && <div className="watch-empty">{symbolSearch.trim() ? '没有匹配的 Binance USDT 永续合约' : '默认自选暂无行情'}</div>}</div><div className="watch-footer"><span>{symbolSearch.trim() ? '仅显示可交易 USDT 永续' : '搜索 Binance 交易对'}</span><b>USⓈ-M Futures</b></div></aside>
-      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><button type="button" className="auto-analysis-label" onClick={() => setAnalysisOpen(true)}>自动分析 · {analysisEnabled ? analysis.environment : '已关闭'}<span>⌄</span></button><h1>{active.replace('USDT', '')}<small>/ USDT · 永续</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<button className={autoTimeframe ? 'auto-time-active' : ''} title="自动：先用 1h 识别；需要细看震荡或突破时切至 15m，并保持该周期，直到手动选择、重新点击自动或切换交易对" onClick={() => { setAutoTimeframe(true); setAutoTimeframeReady(interval === '1h' && !loading && candles.length >= 35); setInterval('1h') }}>自动</button><span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setAnalysisEnabled((enabled) => !enabled); setMoreActionsOpen(false) }}>{analysisEnabled ? '关闭自动分析' : '开启自动分析'}</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setAnalysisIndicators(DEFAULT_ANALYSIS_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}<div className="analysis-summary"><span className="regime-badge">{analysis.environment}</span><span className={`direction-badge ${analysis.direction === '做多' ? 'long' : analysis.direction === '做空' ? 'short' : ''}`}>{analysis.direction}</span><span className="analysis-status">{analysis.status}</span><b>支撑 {formatPrice(analysis.support)} · 阻力 {formatPrice(analysis.resistance)}</b><b>止损 {formatPrice(analysis.stopLoss)} · 止盈 {formatPrice(analysis.takeProfit)}</b><b>参考盈亏比 {analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</b></div>{multiTimeframeAnalysis && <div className="multitimeframe-strip"><strong>多周期 · {multiTimeframeAnalysis.direction} · {multiTimeframeAnalysis.agreement}% 一致</strong><span>{multiTimeframeAnalysis.status}</span>{intervals.map((timeframe) => { const item = multiTimeframeAnalysis.byTimeframe[timeframe]; return <span key={timeframe} className="multitimeframe-item"><b>{timeframe.toUpperCase()}</b> {item.direction} · {item.environment}</span> })}</div>}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small>{hiddenAnalysisLineIds.length > 0 && <button type="button" className="restore-analysis-lines" onClick={restoreAnalysisLines}>恢复自动标注</button>}<span className="toolbar-spacer" /><span className={`chart-status ${connected ? 'online' : ''}`}><i />{connected ? '实时行情 · Binance · ' + chartPaneCount + ' 个指标窗' : '行情连接中'}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}><LiveChart key={`${active}-${interval}`} data={candles} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={displayLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!loading && candles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期 · 震荡/突破时切至 15m 并保持' : '手动周期'} · 自动分析线 · Binance USDⓈ-M · {connected ? '实时' : '等待连接'}</span></div>{analysisOpen && <div className="analysis-modal-backdrop" onClick={() => setAnalysisOpen(false)}><div className="analysis-modal" role="dialog" aria-modal="true" aria-label="自动市场分析" onClick={(event) => event.stopPropagation()}><div className="analysis-modal-head"><div><span className="eyebrow">MARKET READ</span><h3>{active.replace('USDT', '/USDT')} · {interval.toUpperCase()}</h3></div><button type="button" onClick={() => setAnalysisOpen(false)} aria-label="关闭">×</button></div><div className="analysis-modal-state"><span className={`direction-badge ${analysis.direction === '做多' ? 'long' : analysis.direction === '做空' ? 'short' : ''}`}>{analysis.direction}</span><b>{analysis.environment}</b></div><p>{analysis.status}</p><div className="analysis-values"><div><small>参考入场</small><b>{formatPrice(analysis.entry)}</b></div><div><small>支撑位</small><b>{formatPrice(analysis.support)}</b></div><div><small>阻力位</small><b>{formatPrice(analysis.resistance)}</b></div><div><small>止损</small><b>{formatPrice(analysis.stopLoss)}</b></div><div><small>止盈</small><b>{formatPrice(analysis.takeProfit)}</b></div><div><small>参考盈亏比</small><b>{analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</b></div></div>{analysisDetailPanel}<button className="ai-analysis-action" onClick={callAiAnalysis} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? 'AI 正在分析…' : '✦ 调用 AI 助手分析'}</button><div className="analysis-modal-foot">依据已收盘 K 线自动计算；分析线只作参考，不会自动下单。{!health.aiConfigured && <span> AI 服务未配置。</span>}</div></div></div>}</section>
+      <MarketList
+        symbols={filteredSymbols}
+        availableSymbols={availableSymbols}
+        favoriteSymbols={watchlist}
+        active={active}
+        quotes={marketQuotes}
+        search={symbolSearch}
+        loading={symbolCatalogLoading}
+        error={symbolCatalogError}
+        mobileOpen={mobileMarketsOpen}
+        onCloseMobile={() => setMobileMarketsOpen(false)}
+        onSearchChange={setSymbolSearch}
+        onSelect={(symbol) => { if (symbol !== active) { if (autoTimeframe) { setInterval('1h'); setAutoTimeframeReady(false) } setOrderPrice(null); setStopPrice(''); setActivationPrice(''); setClosePosition(false); setActive(symbol) } setMobileMarketsOpen(false) }}
+        onToggleFavorite={toggleFavorite}
+        onMoveFavorite={moveFavorite}
+        onReorder={(from, over) => setWatchlist((current) => reorderWatchlist(current, from, over))}
+      />
+      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><button type="button" className="auto-analysis-label" onClick={() => setAnalysisOpen(true)} disabled={!active}>自动分析 · {analysisEnabled ? analysis.environment : '已关闭'}<span>⌄</span></button><h1>{active ? active.replace('USDT', '') : '选择币种'}<small>{active ? '/ USDT · 永续' : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<button className={autoTimeframe ? 'auto-time-active' : ''} title="自动：先用 1h 识别；需要细看震荡或突破时切至 15m，并保持该周期，直到手动选择、重新点击自动或切换交易对" onClick={() => { setAutoTimeframe(true); setAutoTimeframeReady(interval === '1h' && !loading && candles.length >= 35); setInterval('1h') }}>自动</button><span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setAnalysisEnabled((enabled) => !enabled); setMoreActionsOpen(false) }}>{analysisEnabled ? '关闭自动分析' : '开启自动分析'}</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setAnalysisIndicators(DEFAULT_ANALYSIS_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}<div className="analysis-summary"><span className="regime-badge">{analysis.environment}</span><span className={`direction-badge ${analysis.direction === '做多' ? 'long' : analysis.direction === '做空' ? 'short' : ''}`}>{analysis.direction}</span><span className="analysis-status">{analysis.status}</span><b>支撑 {formatPrice(analysis.support)} · 阻力 {formatPrice(analysis.resistance)}</b><b>止损 {formatPrice(analysis.stopLoss)} · 止盈 {formatPrice(analysis.takeProfit)}</b><b>参考盈亏比 {analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</b></div>{multiTimeframeAnalysis && <div className="multitimeframe-strip"><strong>多周期 · {multiTimeframeAnalysis.direction} · {multiTimeframeAnalysis.agreement}% 一致</strong><span>{multiTimeframeAnalysis.status}</span>{intervals.map((timeframe) => { const item = multiTimeframeAnalysis.byTimeframe[timeframe]; return <span key={timeframe} className="multitimeframe-item"><b>{timeframe.toUpperCase()}</b> {item.direction} · {item.environment}</span> })}</div>}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small>{hiddenAnalysisLineIds.length > 0 && <button type="button" className="restore-analysis-lines" onClick={restoreAnalysisLines}>恢复自动标注</button>}<span className="toolbar-spacer" /><span className={`chart-status ${connected ? 'online' : ''}`}><i />{connected ? '实时行情 · Binance · ' + chartPaneCount + ' 个指标窗' : '行情连接中'}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}><LiveChart key={`${active}-${interval}`} data={candles} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={displayLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && candles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期 · 震荡/突破时切至 15m 并保持' : '手动周期'} · 自动分析线 · Binance USDⓈ-M · {connected ? '实时' : '等待连接'}</span></div>{analysisOpen && <div className="analysis-modal-backdrop" onClick={() => setAnalysisOpen(false)}><div className="analysis-modal" role="dialog" aria-modal="true" aria-label="自动市场分析" onClick={(event) => event.stopPropagation()}><div className="analysis-modal-head"><div><span className="eyebrow">MARKET READ</span><h3>{active.replace('USDT', '/USDT')} · {interval.toUpperCase()}</h3></div><button type="button" onClick={() => setAnalysisOpen(false)} aria-label="关闭">×</button></div><div className="analysis-modal-state"><span className={`direction-badge ${analysis.direction === '做多' ? 'long' : analysis.direction === '做空' ? 'short' : ''}`}>{analysis.direction}</span><b>{analysis.environment}</b></div><p>{analysis.status}</p><div className="analysis-values"><div><small>参考入场</small><b>{formatPrice(analysis.entry)}</b></div><div><small>支撑位</small><b>{formatPrice(analysis.support)}</b></div><div><small>阻力位</small><b>{formatPrice(analysis.resistance)}</b></div><div><small>止损</small><b>{formatPrice(analysis.stopLoss)}</b></div><div><small>止盈</small><b>{formatPrice(analysis.takeProfit)}</b></div><div><small>参考盈亏比</small><b>{analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</b></div></div>{analysisDetailPanel}<button className="ai-analysis-action" onClick={callAiAnalysis} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? 'AI 正在分析…' : '✦ 调用 AI 助手分析'}</button><div className="analysis-modal-foot">依据已收盘 K 线自动计算；分析线只作参考，不会自动下单。{!health.aiConfigured && <span> AI 服务未配置。</span>}</div></div></div>}</section>
       <aside id="trade-panel" className="trade-panel panel">
         <div className="tabs"><button className={tab === 'order' ? 'active' : ''} onClick={() => setTab('order')}>下单</button><button className={tab === 'ai' ? 'active' : ''} onClick={() => setTab('ai')}>AI 助手 <span className="new-dot" /></button></div>
         {tab === 'order' ? <div className="order-content">
@@ -701,13 +809,13 @@ function App() {
           {!hedgeMode && <label className="order-toggle"><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} disabled={closePosition} /><span>只减仓</span></label>}
           {['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(orderType) && <label className="order-toggle"><input type="checkbox" checked={closePosition} onChange={(event) => { setClosePosition(event.target.checked); if (event.target.checked) setReduceOnly(false) }} /><span>平掉该方向全部仓位</span></label>}
           {isTriggeredOrder(orderType) && <label className="order-toggle"><input type="checkbox" checked={priceProtect} onChange={(event) => setPriceProtect(event.target.checked)} /><span>价格保护</span></label>}
-          <button type="button" className="apply-settings" onClick={applyTradingSettings} disabled={!health.privateApiConfigured || !health.tradingEnabled}>应用杠杆与保证金设置</button>
+        <button type="button" className="apply-settings" onClick={applyTradingSettings} disabled={!active || !health.privateApiConfigured || !health.tradingEnabled}>应用杠杆与保证金设置</button>
           <small className="order-settings-note">更改杠杆或保证金模式后，请先应用设置再下单。</small>
           <div className="risk-row"><div><span>参考止损</span><b className="readonly-risk">{formatPrice(analysis.stopLoss)}</b></div><div><span>参考止盈</span><b className="readonly-risk">{formatPrice(analysis.takeProfit)}</b></div></div>
           <div className="risk-note">分析方向 <b>{analysis.direction}</b><span>参考盈亏比 {analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</span></div>
-          <button className={`submit ${side}`} onClick={submitOrder} disabled={!health.tradingEnabled}>{closePosition ? '提交全平条件单' : `${side === 'buy' ? '买入 / 做多' : '卖出 / 做空'} · ${orderTypeOptions.find((item) => item.value === orderType)?.label}`}</button>
+          <button className={`submit ${side}`} onClick={submitOrder} disabled={!active || !health.tradingEnabled}>{closePosition ? '提交全平条件单' : `${side === 'buy' ? '买入 / 做多' : '卖出 / 做空'} · ${orderTypeOptions.find((item) => item.value === orderType)?.label}`}</button>
           {orderMessage && <div className="order-message" role="status">{orderMessage}</div>}
-          <div className="api-note"><span>⌁</span><div><b>{health.tradingEnabled ? '实盘交易已启用' : '实盘交易未启用'}</b><small>{health.privateApiConfigured ? (health.tradingEnabled ? '仅点击上方下单按钮时提交订单' : 'API 已配置，安全开关关闭，订单提交不可用') : '请在后端配置 Binance API Key 后启用下单'}</small></div></div>
+          <div className="api-note"><span>⌁</span><div><b>{health.tradingEnabled ? (health.environment === 'testnet' ? '测试网下单已启用' : '实盘交易已启用') : health.environment === 'testnet' ? '测试网下单未启用' : '实盘交易未启用'}</b><small>{health.privateApiConfigured ? (health.tradingEnabled ? '仅点击上方下单按钮时提交订单' : 'API 已配置，安全开关关闭，订单提交不可用') : '请在后端配置所选环境的 Binance API Key'}</small></div></div>
         </div> : <div className="ai-content"><div className="ai-intro"><div className="ai-spark">✦</div><h3>交易助手</h3><p>结合当前图表、自动分析和手动画线，帮你梳理交易计划。</p><small className={health.aiConfigured ? 'ai-ready' : 'ai-unavailable'}>{health.aiConfigured ? 'AI 已连接 · 可按需调用分析' : 'AI 尚未配置，请检查本地服务设置'}</small></div><div className="messages">{messages.map((message, index) => <div className={message.startsWith('你：') ? 'message user' : 'message'} key={`${message}-${index}`}>{message}</div>)}</div><div className="quick-prompts"><button onClick={() => setQuestion('当前支撑和止损位置合理吗？')}>支撑位合理吗？</button><button onClick={() => setQuestion('帮我梳理这个交易计划')}>梳理交易计划</button></div><div className="ai-input"><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void ask() } }} placeholder="问问关于当前图表的问题..." /><button onClick={() => void ask()} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? '…' : '↑'}</button></div><small className="ai-disclaimer">AI 仅提供信息参考，不构成投资建议，也不会自动下单。</small></div>}
       </aside>
     </main>
@@ -718,7 +826,7 @@ function App() {
         <button className={bottomTab === 'history' ? 'active' : ''} onClick={() => setBottomTab('history')}>历史订单 <span>{orderHistory.length}</span></button>
         <span className="bottom-spacer" />
         <button type="button" className="refresh-account" onClick={() => setPrivateDataRefreshKey((value) => value + 1)} disabled={!health.privateApiConfigured || ordersLoading}>{ordersLoading ? '读取中…' : '刷新'}</button>
-        <button type="button" className="ip-panel-check" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `公网 IP：${publicIp}` : '检测公网 IP'}</button>
+        <button type="button" className="ip-panel-check" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `当前 IP：${publicIp}` : '检测 IP'}</button>
         <span className="account-state"><i />{health.privateApiConfigured ? '私有 API 已配置' : '未连接私有 API'}</span>
       </div>
       {ordersError && <div className="account-error" role="alert">{ordersError}</div>}
