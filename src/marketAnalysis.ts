@@ -139,6 +139,7 @@ function calculateMarket(candles: AnalysisCandle[], livePrice: number | null): M
   let environment: MarketAnalysis['environment']
   let direction: MarketDirection = '观望'
   let status: string
+  let rangeTrade: 'long' | 'short' | null = null
   if (confirmedUp || confirmedDown) {
     environment = '突破确认'
     direction = confirmedUp ? '做多' : '做空'
@@ -159,10 +160,12 @@ function calculateMarket(candles: AnalysisCandle[], livePrice: number | null): M
     const nearResistance = resistance - close <= Math.max(atr * 0.55, width * 0.16)
     if (nearSupport && lastClose > previousClose) {
       direction = '做多'
-      status = '震荡区间下沿出现回升，偏向反弹观察'
+      rangeTrade = 'long'
+      status = '震荡区间下沿收盘反转，参考区间上沿止盈'
     } else if (nearResistance && lastClose < previousClose) {
       direction = '做空'
-      status = '震荡区间上沿出现回落，偏向回落观察'
+      rangeTrade = 'short'
+      status = '震荡区间上沿收盘反转，参考区间下沿止盈'
     } else {
       status = nearSupport || nearResistance ? '价格靠近区间边缘，等待收盘反转确认' : '价格处于区间中部，暂不追单'
     }
@@ -174,6 +177,34 @@ function calculateMarket(candles: AnalysisCandle[], livePrice: number | null): M
   if (direction === '观望') return { environment, direction, support, resistance, stopLoss: null, takeProfit: null, entry, status, rr: null, atr }
 
   const isLong = direction === '做多'
+  if (rangeTrade) {
+    const boundary = rangeTrade === 'long' ? support : resistance
+    const oppositeBoundary = rangeTrade === 'long' ? resistance : support
+    const stopLoss = rangeTrade === 'long' ? boundary - atr * 0.35 : boundary + atr * 0.35
+    const takeProfit = rangeTrade === 'long' ? oppositeBoundary - atr * 0.12 : oppositeBoundary + atr * 0.12
+    const risk = Math.abs(entry - stopLoss)
+    const reward = rangeTrade === 'long' ? takeProfit - entry : entry - takeProfit
+    const rr = risk > 0 ? reward / risk : 0
+    const minimumRangeRiskReward = 1.35
+
+    if (!Number.isFinite(risk) || !Number.isFinite(reward) || risk <= 0 || reward <= 0 || rr < minimumRangeRiskReward) {
+      return {
+        environment,
+        direction: '观望',
+        support,
+        resistance,
+        stopLoss: null,
+        takeProfit: null,
+        entry,
+        status: `${status} · 扣除边界缓冲后盈亏空间不足，暂不交易`,
+        rr: null,
+        atr,
+      }
+    }
+
+    return { environment, direction, support, resistance, stopLoss, takeProfit, entry, status: `${status} · 参考盈亏比 1:${rr.toFixed(1)}`, rr, atr }
+  }
+
   const structuralStop = isLong ? support - atr * 0.35 : resistance + atr * 0.35
   const minimumDistanceStop = isLong ? entry - atr * 0.75 : entry + atr * 0.75
   const stopLoss = isLong ? Math.min(structuralStop, minimumDistanceStop) : Math.max(structuralStop, minimumDistanceStop)

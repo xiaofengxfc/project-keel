@@ -16,10 +16,11 @@ type Props = {
   onAddLevel: (price: number) => void
   onAddTrend: (start: Trend['start'], end: Trend['end']) => void
   onRemoveLevel: (id: number) => void
+  onRemoveTrend: (id: number) => void
   onLoadOlder: () => void
 }
 
-export default function LiveChart({ data, livePrice, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder }: Props) {
+export default function LiveChart({ data, livePrice, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -29,13 +30,17 @@ export default function LiveChart({ data, livePrice, levels, trends, tool, level
   const previousData = useRef<Candle[]>([])
   const hasInitializedData = useRef(false)
   const toolRef = useRef(tool)
-  const levelLabelRef = useRef(levelLabel)
-  const callbacks = useRef({ onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder })
+  const levelsRef = useRef(levels)
+  const trendsRef = useRef(trends)
+  const callbacks = useRef({ onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder })
   const [revision, setRevision] = useState(0)
   const [size, setSize] = useState({ width: 0, height: 0 })
-  toolRef.current = tool
-  levelLabelRef.current = levelLabel
-  callbacks.current = { onAddLevel, onAddTrend, onRemoveLevel, onLoadOlder }
+  useEffect(() => {
+    toolRef.current = tool
+    levelsRef.current = levels
+    trendsRef.current = trends
+    callbacks.current = { onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }
+  }, [levelLabel, levels, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder, tool, trends])
 
   useEffect(() => {
     const element = host.current
@@ -58,7 +63,7 @@ export default function LiveChart({ data, livePrice, levels, trends, tool, level
     chartRef.current = chart
     seriesRef.current = series
     const clickHandler = (event: MouseEventParams<Time>) => {
-      if (!event.point || !event.time || !seriesRef.current) return
+      if (!event.point || event.time === undefined || !seriesRef.current) return
       const value = seriesRef.current.coordinateToPrice(event.point.y)
       if (value === null || typeof event.time !== 'number') return
       if (toolRef.current === 'horizontal') callbacks.current.onAddLevel(value)
@@ -67,17 +72,40 @@ export default function LiveChart({ data, livePrice, levels, trends, tool, level
         else { callbacks.current.onAddTrend(pendingTrend.current, { time: event.time, price: value }); pendingTrend.current = null }
       }
     }
-    const doubleClickHandler = (event: MouseEventParams<Time>) => {
+    const findNearestLevel = (event: MouseEventParams<Time>) => {
       if (!event.point || !seriesRef.current) return
-      const clickedPrice = seriesRef.current.coordinateToPrice(event.point.y)
-      if (clickedPrice === null) return
-      const nearest = levels.reduce<{ id: number; distance: number } | null>((best, item) => {
+      // Auto-analysis lines use negative ids; only user-created levels can be removed here.
+      const nearest = levelsRef.current.filter((item) => item.id >= 0).reduce<{ id: number; distance: number } | null>((best, item) => {
         const coordinate = seriesRef.current?.priceToCoordinate(item.price)
         if (coordinate === null || coordinate === undefined) return best
         const distance = Math.abs(coordinate - event.point!.y)
         return distance <= 12 && (!best || distance < best.distance) ? { id: item.id, distance } : best
       }, null)
       if (nearest) callbacks.current.onRemoveLevel(nearest.id)
+      return nearest
+    }
+    const findNearestTrend = (event: MouseEventParams<Time>) => {
+      if (!event.point || !seriesRef.current) return
+      const nearestTrend = trendsRef.current.reduce<{ id: number; distance: number } | null>((best, trend) => {
+        const x1 = chart.timeScale().timeToCoordinate(trend.start.time as Time)
+        const x2 = chart.timeScale().timeToCoordinate(trend.end.time as Time)
+        const y1 = seriesRef.current?.priceToCoordinate(trend.start.price)
+        const y2 = seriesRef.current?.priceToCoordinate(trend.end.price)
+        if (x1 === null || x1 === undefined || x2 === null || x2 === undefined || y1 === null || y1 === undefined || y2 === null || y2 === undefined) return best
+        const dx = x2 - x1
+        const dy = y2 - y1
+        const lengthSquared = dx * dx + dy * dy
+        const projection = lengthSquared === 0 ? 0 : Math.max(0, Math.min(1, ((event.point!.x - x1) * dx + (event.point!.y - y1) * dy) / lengthSquared))
+        const distance = Math.hypot(event.point!.x - (x1 + projection * dx), event.point!.y - (y1 + projection * dy))
+        return distance <= 8 && (!best || distance < best.distance) ? { id: trend.id, distance } : best
+      }, null)
+      if (nearestTrend) callbacks.current.onRemoveTrend(nearestTrend.id)
+      return nearestTrend
+    }
+    const doubleClickHandler = (event: MouseEventParams<Time>) => {
+      if (toolRef.current !== 'cursor') return
+      if (findNearestLevel(event)) return
+      findNearestTrend(event)
     }
     chart.subscribeClick(clickHandler)
     chart.subscribeDblClick(doubleClickHandler)

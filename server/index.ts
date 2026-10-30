@@ -150,7 +150,7 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
   }
 })
 
-app.post<{ Body: { question: string; context: { symbol: string; interval: string; price: number | null; analysis?: { environment: string; direction: string; status: string; entry: number | null; support: number | null; resistance: number | null; stopLoss: number | null; takeProfit: number | null; riskReward: number | null }; lines: Array<{ label: string; price: number }> } } }>('/api/assistant', async (request, reply) => {
+app.post<{ Body: { question: string; context: { symbol: string; interval: string; price: number | null; analysis?: { environment: string; direction: string; status: string; entry: number | null; support: number | null; resistance: number | null; stopLoss: number | null; takeProfit: number | null; riskReward: number | null }; lines: Array<{ label: string; price: number }>; trends?: Array<{ id: number; start: { time: number; price: number }; end: { time: number; price: number } }>; candles?: Array<{ time: number; open: number; high: number; low: number; close: number }> } } }>('/api/assistant', async (request, reply) => {
   if (!aiModel || !aiBaseUrl) return reply.code(503).send({ error: '本地服务器尚未配置 OpenAI 兼容 AI 服务。' })
   const question = request.body?.question?.trim()
   if (!question) return reply.code(400).send({ error: '请输入问题' })
@@ -164,7 +164,7 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
       body: JSON.stringify({
         model: aiModel,
         messages: [
-          { role: 'system', content: '你是交易工作台中的信息助手。只基于用户提供的行情上下文回答，不编造实时数据，不保证收益，不替用户下单；明确标注不确定性。' },
+          { role: 'system', content: '你是 KEEL 个人交易工作台里的中文市场分析助手，服务于 Binance USDⓈ-M Futures 图表。用户主动调用你做复核和解释；本地程序已提供交易对、周期、价格、近期K线、支撑阻力、市场环境、参考入场/止盈/止损/盈亏比及用户画线。只使用本次上下文，不声称拿到了未提供的实时行情，不编造价格、指标或消息。先区分本地程序计算结果与自己的判断；若数据不足、K线不完整或上下文矛盾，明确说明。分析震荡区间时区分下沿、上沿和区间中部：边缘确认后才讨论反弹/回落计划，中部原则上观望；止损应在失效边界之外，止盈优先看区间另一侧，并核对参考盈亏比，空间不足时提示观望。输出简洁、可核对的中文小节：市场状态与依据、计划方向/入场条件、参考止损、参考止盈、参考盈亏比、失效条件与不确定性；没有可用方向时明确写观望。所有价位仅供参考，不保证收益，不替用户下单，也不把建议写成确定预测。' },
           { role: 'user', content: `当前上下文：${JSON.stringify(context)}\n\n问题：${question}` },
         ],
         temperature: 0.4,
