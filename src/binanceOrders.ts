@@ -61,6 +61,32 @@ export function isStepAligned(value: string, step: string) {
   return integer !== null && increment !== null && increment > 0n && integer % increment === 0n
 }
 
+export function floorToStep(value: number, step: string): string {
+  const decimal = (input: string): { units: bigint; scale: number } | null => {
+    const match = /^(?:([0-9]+)(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?$/.exec(input)
+    if (!match) return null
+    let digits = `${match[1] ?? '0'}${match[2] ?? match[3] ?? ''}`.replace(/^0+(?=\d)/, '')
+    let scale = (match[2] ?? match[3] ?? '').length - Number(match[4] ?? 0)
+    if (scale < 0) { digits += '0'.repeat(-scale); scale = 0 }
+    while (digits.length <= scale) digits = `0${digits}`
+    return { units: BigInt(digits), scale }
+  }
+  if (!Number.isFinite(value) || value <= 0) return '0'
+  const amountDecimal = decimal(String(value))
+  const stepDecimal = decimal(step)
+  if (!amountDecimal || !stepDecimal || stepDecimal.units <= 0n) return '0'
+  const scale = Math.max(amountDecimal.scale, stepDecimal.scale)
+  const amount = amountDecimal.units * 10n ** BigInt(scale - amountDecimal.scale)
+  const increment = stepDecimal.units * 10n ** BigInt(scale - stepDecimal.scale)
+  const floored = (amount / increment) * increment
+  if (floored === 0n) return '0'
+  const digits = floored.toString().padStart(scale + 1, '0')
+  if (scale === 0) return digits
+  const integer = digits.slice(0, -scale) || '0'
+  const fraction = digits.slice(-scale).replace(/0+$/, '')
+  return fraction ? `${integer}.${fraction}` : integer
+}
+
 export function validateBinanceOrder(input: BinanceOrderInput): string | null {
   if (typeof input.symbol !== 'string' || !/^[A-Z0-9]{3,20}$/.test(input.symbol.toUpperCase())) return '请提供有效的交易对'
   if (!['BUY', 'SELL'].includes(input.side)) return '请选择有效的买卖方向'

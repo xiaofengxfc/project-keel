@@ -4,7 +4,7 @@ import 'dotenv/config'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
-import { isMarketExecution, isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
+import { isMarketExecution, isStepAligned, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
 import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
 
 const app = Fastify({ logger: true })
@@ -156,6 +156,16 @@ app.get('/api/account/position-mode', async (_request, reply) => {
   }
 })
 
+app.post<{ Body: { dualSidePosition?: boolean } }>('/api/account/position-mode', async (request, reply) => {
+  if (!tradingEnabled) return reply.code(403).send({ error: '持仓模式设置已关闭，请先启用交易安全开关' })
+  if (typeof request.body?.dualSidePosition !== 'boolean') return reply.code(400).send({ error: '请选择单向或双向持仓模式' })
+  try {
+    return await binanceRequest('POST', '/fapi/v1/positionSide/dual', { dualSidePosition: request.body.dualSidePosition }, true)
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '更新持仓模式失败' })
+  }
+})
+
 app.post<{ Body: { symbol?: string; leverage?: number } }>('/api/account/leverage', async (request, reply) => {
   if (!tradingEnabled) return reply.code(403).send({ error: '杠杆设置已关闭，请先启用实盘交易安全开关' })
   const symbol = request.body?.symbol?.toUpperCase()
@@ -166,6 +176,19 @@ app.post<{ Body: { symbol?: string; leverage?: number } }>('/api/account/leverag
     return await binanceRequest('POST', '/fapi/v1/leverage', { symbol, leverage }, true)
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '更新杠杆失败' })
+  }
+})
+
+app.get<{ Querystring: { symbol?: string } }>('/api/account/leverage-brackets', async (request, reply) => {
+  const symbol = request.query.symbol?.toUpperCase()
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  try {
+    const rows = await binanceRequest<Array<{ symbol: string; brackets: Array<{ bracket: number; initialLeverage: number; notionalFloor?: string; notionalCap: string }> }>>('GET', '/fapi/v1/leverageBracket', { symbol }, true)
+    const row = rows.find((item) => item.symbol === symbol)
+    if (!row) return reply.code(404).send({ error: '未找到该合约的杠杆档位' })
+    return { symbol: row.symbol, brackets: row.brackets.map((bracket, index) => ({ ...bracket, notionalFloor: bracket.notionalFloor ?? (index === 0 ? '0' : row.brackets[index - 1]?.notionalCap ?? '0') })) }
+  } catch (error) {
+    return reply.code(503).send({ error: error instanceof Error ? error.message : '读取杠杆档位失败' })
   }
 })
 
@@ -186,7 +209,25 @@ app.get<{ Querystring: { symbol?: string } }>('/api/open-orders', async (request
   const symbol = request.query.symbol?.toUpperCase()
   if (symbol && !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
   try {
-    return await binanceRequest('GET', '/fapi/v1/openOrders', { symbol }, true)
+    const orders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true)
+    const algoOrders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true).catch(() => [])
+    const normalizedAlgoOrders = algoOrders.map((order) => ({
+      orderId: order.algoId,
+      symbol: order.symbol,
+      side: order.side,
+      type: order.orderType ?? order.type,
+      positionSide: order.positionSide,
+      closePosition: order.closePosition,
+      price: order.price ?? '0',
+      stopPrice: order.triggerPrice ?? order.stopPrice ?? '0',
+      origQty: order.quantity ?? order.origQty ?? '0',
+      executedQty: order.executedQty ?? '0',
+      status: order.algoStatus ?? order.status ?? 'NEW',
+      time: order.createTime ?? order.time ?? 0,
+      updateTime: order.updateTime ?? order.createTime ?? order.time ?? 0,
+      isAlgoOrder: true,
+    }))
+    return [...orders, ...normalizedAlgoOrders]
   } catch (error) {
     return reply.code(503).send({ error: error instanceof Error ? error.message : '读取当前委托失败' })
   }
@@ -202,6 +243,120 @@ app.get<{ Querystring: { symbol?: string; limit?: string; orderId?: string } }>(
     return await binanceRequest('GET', '/fapi/v1/allOrders', { symbol, limit, orderId }, true)
   } catch (error) {
     return reply.code(503).send({ error: error instanceof Error ? error.message : '读取历史订单失败' })
+  }
+})
+
+app.get<{ Querystring: { symbol?: string; limit?: string; fromId?: string } }>('/api/account/trades', async (request, reply) => {
+  const symbol = request.query.symbol?.toUpperCase()
+  const limit = Math.min(Math.max(Number(request.query.limit ?? 100), 1), 1000)
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  if (!Number.isInteger(limit)) return reply.code(400).send({ error: 'limit 必须是 1 到 1000 的整数' })
+  try {
+    return await binanceRequest('GET', '/fapi/v1/userTrades', { symbol, limit, fromId: request.query.fromId }, true)
+  } catch (error) {
+    return reply.code(503).send({ error: error instanceof Error ? error.message : '读取成交记录失败' })
+  }
+})
+
+app.post<{ Body: { symbol?: string; positionSide?: string; quantity?: string } }>('/api/account/close-position', async (request, reply) => {
+  if (!tradingEnabled) return reply.code(403).send({ error: '平仓功能已关闭，请先启用实盘交易安全开关' })
+  const symbol = request.body?.symbol?.toUpperCase()
+  const positionSide = request.body?.positionSide
+  const quantity = request.body?.quantity
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  if (!['BOTH', 'LONG', 'SHORT'].includes(positionSide ?? '')) return reply.code(400).send({ error: '请提供有效的持仓方向' })
+  if (quantity !== undefined && (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0)) return reply.code(400).send({ error: '平仓数量必须大于 0' })
+  try {
+    const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v2/positionRisk', { symbol }, true)
+    const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide)
+    const currentAmount = Number(position?.positionAmt)
+    if (!position || !Number.isFinite(currentAmount) || currentAmount === 0) return reply.code(400).send({ error: '该方向当前没有可平仓位' })
+    const closeQuantity = quantity === undefined ? Math.abs(currentAmount) : Number(quantity)
+    if (closeQuantity > Math.abs(currentAmount)) return reply.code(400).send({ error: '平仓数量不能大于当前持仓数量' })
+    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; notional?: string; minNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
+    const filters = info.symbols.find((item) => item.symbol === symbol)?.filters ?? []
+    const quantityText = quantity === undefined ? String(Math.abs(currentAmount)) : quantity
+    for (const filter of filters.filter((item) => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE')) {
+      if (filter.minQty && Number(filter.minQty) > 0 && closeQuantity < Number(filter.minQty)) return reply.code(400).send({ error: `平仓数量低于 Binance 最小值 (${filter.minQty})` })
+      if (filter.maxQty && Number(filter.maxQty) > 0 && closeQuantity > Number(filter.maxQty)) return reply.code(400).send({ error: `平仓数量超过 Binance 最大值 (${filter.maxQty})` })
+      if (filter.stepSize && Number(filter.stepSize) > 0 && !isStepAligned(quantityText, filter.stepSize)) return reply.code(400).send({ error: `平仓数量必须符合 Binance 步长 (${filter.stepSize})` })
+    }
+    const notionalFilter = filters.find((item) => item.filterType === 'MIN_NOTIONAL' || item.filterType === 'NOTIONAL')
+    const minimumNotional = Number(notionalFilter?.notional ?? notionalFilter?.minNotional)
+    const markPrice = Number(position.markPrice)
+    if (minimumNotional > 0 && Number.isFinite(markPrice) && closeQuantity * markPrice < minimumNotional) return reply.code(400).send({ error: `平仓名义价值低于 Binance 最小值 (${minimumNotional} USDT)` })
+    const side = currentAmount > 0 ? 'SELL' : 'BUY'
+    const params: Record<string, QueryValue> = { symbol, side, type: 'MARKET', quantity: quantityText }
+    if (positionSide === 'LONG' || positionSide === 'SHORT') params.positionSide = positionSide
+    else params.reduceOnly = true
+    return await binanceRequest('POST', '/fapi/v1/order', params, true)
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '平仓失败' })
+  }
+})
+
+app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLoss?: string; takeProfit?: string; workingType?: string } }>('/api/account/position-tpsl', async (request, reply) => {
+  if (!tradingEnabled) return reply.code(403).send({ error: '止盈止损设置已关闭，请先启用交易安全开关' })
+  const symbol = request.body?.symbol?.toUpperCase()
+  const positionSide = request.body?.positionSide
+  const stopLossProvided = typeof request.body?.stopLoss === 'string'
+  const takeProfitProvided = typeof request.body?.takeProfit === 'string'
+  const stopLoss = request.body?.stopLoss?.trim() || undefined
+  const takeProfit = request.body?.takeProfit?.trim() || undefined
+  const workingType = request.body?.workingType ?? 'CONTRACT_PRICE'
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  if (!['BOTH', 'LONG', 'SHORT'].includes(positionSide ?? '')) return reply.code(400).send({ error: '请提供有效的持仓方向' })
+  if (request.body?.side !== undefined && !['BUY', 'SELL'].includes(request.body.side)) return reply.code(400).send({ error: '保护单方向无效' })
+  if (!stopLossProvided && !takeProfitProvided) return reply.code(400).send({ error: '请至少提供一个需要更新或清除的保护价格' })
+  if ([stopLoss, takeProfit].some((value) => value !== undefined && (!Number.isFinite(Number(value)) || Number(value) <= 0))) return reply.code(400).send({ error: '止盈止损价格必须大于 0' })
+  if (!['MARK_PRICE', 'CONTRACT_PRICE'].includes(workingType)) return reply.code(400).send({ error: '触发参考价格无效' })
+  try {
+    const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v2/positionRisk', { symbol }, true)
+    const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide)
+    const amount = Number(position?.positionAmt)
+    if (position && (!Number.isFinite(amount) || amount === 0)) return reply.code(400).send({ error: '该方向当前没有持仓' })
+    if (!position && !request.body?.side) return reply.code(400).send({ error: '没有持仓时需要提供保护单方向' })
+    const side = position ? amount > 0 ? 'SELL' : 'BUY' : request.body!.side!
+    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; tickSize?: string; minPrice?: string; maxPrice?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
+    const priceFilter = info.symbols.find((item) => item.symbol === symbol)?.filters.find((item) => item.filterType === 'PRICE_FILTER')
+    for (const value of [stopLoss, takeProfit]) {
+      if (!value) continue
+      const price = Number(value)
+      if (priceFilter?.minPrice && Number(priceFilter.minPrice) > 0 && price < Number(priceFilter.minPrice)) return reply.code(400).send({ error: `价格低于 Binance 最小值 (${priceFilter.minPrice})` })
+      if (priceFilter?.maxPrice && Number(priceFilter.maxPrice) > 0 && price > Number(priceFilter.maxPrice)) return reply.code(400).send({ error: `价格超过 Binance 最大值 (${priceFilter.maxPrice})` })
+      if (priceFilter?.tickSize && Number(priceFilter.tickSize) > 0 && !isStepAligned(value, priceFilter.tickSize)) return reply.code(400).send({ error: `价格必须符合 Binance 最小变动单位 (${priceFilter.tickSize})` })
+    }
+    const markPrice = Number(position?.markPrice ?? (await binanceRequest<{ markPrice: string }>('GET', '/fapi/v1/premiumIndex', { symbol })).markPrice)
+    const isLong = position ? amount > 0 : positionSide === 'LONG' || positionSide === 'BOTH' && side === 'SELL'
+    if (stopLoss && (isLong ? Number(stopLoss) >= markPrice : Number(stopLoss) <= markPrice)) return reply.code(400).send({ error: isLong ? '多仓止损价必须低于标记价格' : '空仓止损价必须高于标记价格' })
+    if (takeProfit && (isLong ? Number(takeProfit) <= markPrice : Number(takeProfit) >= markPrice)) return reply.code(400).send({ error: isLong ? '多仓止盈价必须高于标记价格' : '空仓止盈价必须低于标记价格' })
+    const [standardOrders, algoOrders] = await Promise.all([
+      binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true),
+      binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true).catch(() => []),
+    ])
+    const existingOrders = [...standardOrders, ...algoOrders.map((order) => ({ ...order, orderId: order.algoId, type: order.orderType ?? order.type, stopPrice: order.triggerPrice ?? order.stopPrice, isAlgoOrder: true }))] as Array<{ orderId: number; symbol: string; type: string; side: string; positionSide?: string; closePosition?: boolean | string; isAlgoOrder?: boolean }>
+    const protectSide = side
+    const matchingProtectionOrders = existingOrders.filter((order) => order.symbol === symbol && order.side === protectSide && ['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(order.type) && (order.closePosition === true || order.closePosition === 'true') && (order.positionSide ?? 'BOTH') === positionSide)
+    const placed: Array<{ orderId: number }> = []
+    try {
+      for (const [kind, stopPrice, shouldUpdate] of [['STOP_MARKET', stopLoss, stopLossProvided], ['TAKE_PROFIT_MARKET', takeProfit, takeProfitProvided]] as const) {
+        if (!shouldUpdate || !stopPrice) continue
+        const algoParams: Record<string, QueryValue> = {
+          algoType: 'CONDITIONAL', symbol, side, type: kind, triggerPrice: stopPrice,
+          closePosition: true, workingType,
+        }
+        if (positionSide === 'LONG' || positionSide === 'SHORT') algoParams.positionSide = positionSide
+        placed.push(await binanceRequest<{ algoId: number }>('POST', '/fapi/v1/algoOrder', algoParams, true).then((result) => ({ orderId: result.algoId })))
+      }
+    } catch (error) {
+      await Promise.allSettled(placed.map((order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true)))
+      throw error
+    }
+    const oldOrdersToCancel = matchingProtectionOrders.filter((order) => order.type === 'STOP_MARKET' ? stopLossProvided : takeProfitProvided)
+    for (const order of oldOrdersToCancel) await binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true)
+    return { orders: placed, canceled: oldOrdersToCancel.length }
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '设置止盈止损失败' })
   }
 })
 
@@ -244,6 +399,20 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
       if (Number.isFinite(referencePrice) && referencePrice > 0 && quantity * referencePrice < minimumNotional) return reply.code(400).send({ error: `订单名义价值低于 Binance 最小值 (${minimumNotional} USDT)` })
     }
     const params = toBinanceOrderParams(body) as Record<string, QueryValue>
+    if (isTriggeredOrder(body.type)) {
+      const algoParams: Record<string, QueryValue> = {
+        algoType: 'CONDITIONAL', symbol: body.symbol.toUpperCase(), side: body.side, type: body.type,
+        quantity: params.quantity as string | undefined, price: params.price as string | undefined,
+        timeInForce: params.timeInForce as string | undefined,
+        triggerPrice: params.stopPrice as string | undefined,
+        reduceOnly: params.reduceOnly as boolean | undefined,
+        closePosition: params.closePosition as boolean | undefined,
+        positionSide: body.positionSide === 'BOTH' ? undefined : body.positionSide,
+        workingType: params.workingType as string | undefined,
+        priceProtect: params.priceProtect as boolean | undefined,
+      }
+      return await binanceRequest('POST', '/fapi/v1/algoOrder', algoParams, true)
+    }
     return await binanceRequest('POST', '/fapi/v1/order', params, true)
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '订单被拒绝' })
@@ -278,12 +447,13 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
   }
 })
 
-app.delete<{ Querystring: { symbol?: string; orderId?: string } }>('/api/order', async (request, reply) => {
+app.delete<{ Querystring: { symbol?: string; orderId?: string; algoId?: string } }>('/api/order', async (request, reply) => {
   if (!tradingEnabled) return reply.code(403).send({ error: '本地服务器已关闭实盘交易。' })
-  if (!request.query.symbol || !request.query.orderId) return reply.code(400).send({ error: 'symbol 和 orderId 为必填项' })
+  if (!request.query.symbol || (!request.query.orderId && !request.query.algoId)) return reply.code(400).send({ error: 'symbol 和订单编号为必填项' })
   const symbol = request.query.symbol.toUpperCase()
-  if (!/^[A-Z0-9]{3,20}$/.test(symbol) || !/^\d+$/.test(request.query.orderId)) return reply.code(400).send({ error: 'symbol 或 orderId 格式无效' })
+  if (!/^[A-Z0-9]{3,20}$/.test(symbol) || (request.query.orderId && !/^\d+$/.test(request.query.orderId)) || (request.query.algoId && !/^\d+$/.test(request.query.algoId))) return reply.code(400).send({ error: 'symbol 或订单编号格式无效' })
   try {
+    if (request.query.algoId) return await binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: request.query.algoId }, true)
     return await binanceRequest('DELETE', '/fapi/v1/order', { symbol, orderId: request.query.orderId }, true)
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '撤单被拒绝' })

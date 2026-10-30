@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
-import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, type AutoscaleInfo, type IChartApi, type IPriceLine, type ISeriesApi, type MouseEventParams, type Time } from 'lightweight-charts'
+import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, createSeriesMarkers, type AutoscaleInfo, type IChartApi, type IPriceLine, type ISeriesApi, type ISeriesMarkersPluginApi, type MouseEventParams, type SeriesMarker, type Time } from 'lightweight-charts'
 import type { ChartIndicatorKey, TechnicalIndicatorSet } from './technicalIndicators'
 
 type Candle = { time: number; open: number; high: number; low: number; close: number }
-type Level = { id: number; price: number; label: string; color: string }
+type Level = { id: number; price: number; label: string; color: string; deletable?: boolean }
 type Trend = { id: number; start: { time: number; price: number }; end: { time: number; price: number } }
+type Trade = { id: number; side: 'BUY' | 'SELL'; price: number; time: number }
 type Tool = 'cursor' | 'horizontal' | 'trend'
 
 type Props = {
   data: Candle[]
+  trades?: Trade[]
   levels: Level[]
   trends: Trend[]
   indicators: TechnicalIndicatorSet
@@ -22,11 +24,12 @@ type Props = {
   onLoadOlder: () => void
 }
 
-export default function LiveChart({ data, levels, trends, indicators, enabledIndicators, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
+export default function LiveChart({ data, trades = [], levels, trends, indicators, enabledIndicators, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const trendOverlayRef = useRef<SVGSVGElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
   const priceLineRef = useRef<Map<number, IPriceLine>>(new Map())
   const indicatorSeries = useRef<Map<string, ISeriesApi<'Line' | 'Histogram'>>>(new Map())
   const savedVisibleRange = useRef<{ from: number; to: number } | null>(null)
@@ -68,7 +71,7 @@ export default function LiveChart({ data, levels, trends, indicators, enabledInd
       autoscaleInfoProvider: (baseImplementation: () => AutoscaleInfo | null) => {
         const info = baseImplementation()
         if (!info?.priceRange) return info
-        const referencePrices = levelsRef.current.filter((level) => level.id < 0).map((level) => level.price)
+        const referencePrices = levelsRef.current.map((level) => level.price)
         if (!referencePrices.length) return info
         const range = info.priceRange.maxValue - info.priceRange.minValue
         const padding = range > 0 ? range * 0.04 : Math.abs(info.priceRange.maxValue) * 0.004
@@ -83,6 +86,7 @@ export default function LiveChart({ data, levels, trends, indicators, enabledInd
     })
     chartRef.current = chart
     seriesRef.current = series
+    markersRef.current = createSeriesMarkers(series, [])
     const addLine = (key: string, color: string, paneIndex = 0, lineWidth: 1 | 2 = 2) => {
       const line = chart.addSeries(LineSeries, { color, lineWidth, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false }, paneIndex)
       indicatorSeriesMap.set(key, line)
@@ -131,7 +135,7 @@ export default function LiveChart({ data, levels, trends, indicators, enabledInd
     }
     const findNearestLevel = (event: MouseEventParams<Time>) => {
       if (!event.point || !seriesRef.current) return
-      const nearest = levelsRef.current.reduce<{ id: number; distance: number } | null>((best, item) => {
+      const nearest = levelsRef.current.filter((item) => item.deletable !== false).reduce<{ id: number; distance: number } | null>((best, item) => {
         const coordinate = seriesRef.current?.priceToCoordinate(item.price)
         if (coordinate === null || coordinate === undefined) return best
         const distance = Math.abs(coordinate - event.point!.y)
@@ -192,6 +196,7 @@ export default function LiveChart({ data, levels, trends, indicators, enabledInd
       hasInitializedData.current = false
       chartRef.current = null
       seriesRef.current = null
+      markersRef.current = null
     }
   }, [enabledIndicators])
 
@@ -263,6 +268,19 @@ export default function LiveChart({ data, levels, trends, indicators, enabledInd
       series.setData(values.map((item) => ({ time: item.time as Time, value: item.value, ...(item.color ? { color: item.color } : {}) })) as never)
     }
   }, [data, enabledIndicators, indicators])
+
+  useEffect(() => {
+    const markers = trades.flatMap((trade) => Number.isFinite(trade.time) && Number.isFinite(trade.price) && trade.price > 0 ? [{
+      id: String(trade.id),
+      time: Math.floor(trade.time / 1000) as Time,
+      price: trade.price,
+      position: trade.side === 'BUY' ? 'atPriceBottom' as const : 'atPriceTop' as const,
+      color: trade.side === 'BUY' ? '#168b63' : '#ca6865',
+      shape: trade.side === 'BUY' ? 'arrowUp' as const : 'arrowDown' as const,
+      text: trade.side === 'BUY' ? '买' : '卖',
+    }] : []).sort((left, right) => Number(left.time) - Number(right.time))
+    markersRef.current?.setMarkers(markers as SeriesMarker<Time>[])
+  }, [trades])
 
   useEffect(() => {
     const series = seriesRef.current

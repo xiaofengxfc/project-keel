@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.ts'
+import { floorToStep, isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.ts'
 import { calculateTechnicalIndicators } from '../src/technicalIndicators.ts'
+
+test('floorToStep preserves integer trailing zeroes and aligns decimals', () => {
+  assert.equal(floorToStep(109.9, '1'), '109')
+  assert.equal(floorToStep(0.29, '0.1'), '0.2')
+  assert.equal(floorToStep(1.25, '0.05'), '1.25')
+})
 
 test('market orders omit limit price while limit and conditional-limit orders retain Binance fields', () => {
   const market: BinanceOrderInput = { symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quantity: '0.01' }
