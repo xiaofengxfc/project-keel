@@ -62,3 +62,25 @@ test('confirmed rejection at the upper range edge gives a bounded short plan', (
   assert.ok(analysis.support !== null && analysis.takeProfit !== null && analysis.takeProfit > analysis.support)
   assert.ok(analysis.rr !== null && analysis.rr >= 1.35)
 })
+
+test('range setup with insufficient reward stays flat without misleading levels', () => {
+  const closes = Array.from({ length: 102 }, (_, index) => index % 2 === 0 ? 96 : 94)
+  closes[99] = 93
+  closes[100] = 94
+  const candles = closes.map((close, index) => ({
+    time: index,
+    open: close,
+    high: 110,
+    low: 90,
+    close,
+  }))
+
+  const analysis = analyzeMarket(candles)
+
+  assert.equal(analysis.environment, '震荡区间')
+  assert.equal(analysis.direction, '观望')
+  assert.match(analysis.status, /盈亏空间不足/)
+  assert.equal(analysis.stopLoss, null)
+  assert.equal(analysis.takeProfit, null)
+  assert.equal(analysis.rr, null)
+})

@@ -22,6 +22,7 @@ type Props = {
 
 export default function LiveChart({ data, livePrice, levels, trends, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
+  const trendOverlayRef = useRef<SVGSVGElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const priceLineRef = useRef<Map<number, IPriceLine>>(new Map())
@@ -198,16 +199,32 @@ export default function LiveChart({ data, livePrice, levels, trends, tool, level
     chartRef.current?.applyOptions({ localization: { locale: 'zh-CN' } })
   }, [data.length])
 
-  const paths = trends.map((trend) => {
-    const x1 = chartRef.current?.timeScale().timeToCoordinate(trend.start.time as Time)
-    const x2 = chartRef.current?.timeScale().timeToCoordinate(trend.end.time as Time)
-    const y1 = seriesRef.current?.priceToCoordinate(trend.start.price)
-    const y2 = seriesRef.current?.priceToCoordinate(trend.end.price)
-    return x1 === null || x1 === undefined || x2 === null || x2 === undefined || y1 === null || y1 === undefined || y2 === null || y2 === undefined ? null : <line key={trend.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke="#7a69d5" strokeWidth="2" strokeDasharray="5 3" />
-  })
+  useEffect(() => {
+    const overlay = trendOverlayRef.current
+    const chart = chartRef.current
+    const series = seriesRef.current
+    if (!overlay || !chart || !series) return
+    const lines = trends.flatMap((trend) => {
+      const x1 = chart.timeScale().timeToCoordinate(trend.start.time as Time)
+      const x2 = chart.timeScale().timeToCoordinate(trend.end.time as Time)
+      const y1 = series.priceToCoordinate(trend.start.price)
+      const y2 = series.priceToCoordinate(trend.end.price)
+      if (x1 === null || x2 === null || y1 === null || y2 === null) return []
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line')
+      line.setAttribute('x1', String(x1))
+      line.setAttribute('y1', String(y1))
+      line.setAttribute('x2', String(x2))
+      line.setAttribute('y2', String(y2))
+      line.setAttribute('stroke', '#7a69d5')
+      line.setAttribute('stroke-width', '2')
+      line.setAttribute('stroke-dasharray', '5 3')
+      return [line]
+    })
+    overlay.replaceChildren(...lines)
+  }, [data, revision, size, trends])
 
   return <div className={`live-chart ${tool !== 'cursor' ? 'drawing' : ''}`} ref={host} data-level-label={levelLabel} data-chart-width={size.width} data-redraw={revision}>
-    <svg className="trend-overlay" width={size.width} height={size.height} aria-hidden="true">{paths}</svg>
+    <svg ref={trendOverlayRef} className="trend-overlay" width={size.width} height={size.height} aria-hidden="true" />
     {tool === 'trend' && <div className="drawing-hint">在图表上依次点选起点和终点</div>}
     {tool === 'horizontal' && <div className="drawing-hint">点击图表放置{levelLabel}</div>}
   </div>
