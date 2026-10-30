@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, type IChartApi, type IPriceLine, type ISeriesApi, type MouseEventParams, type Time } from 'lightweight-charts'
+import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, type AutoscaleInfo, type IChartApi, type IPriceLine, type ISeriesApi, type MouseEventParams, type Time } from 'lightweight-charts'
 import type { ChartIndicatorKey, TechnicalIndicatorSet } from './technicalIndicators'
 
 type Candle = { time: number; open: number; high: number; low: number; close: number }
@@ -9,7 +9,6 @@ type Tool = 'cursor' | 'horizontal' | 'trend'
 
 type Props = {
   data: Candle[]
-  livePrice: number | null
   levels: Level[]
   trends: Trend[]
   indicators: TechnicalIndicatorSet
@@ -23,7 +22,7 @@ type Props = {
   onLoadOlder: () => void
 }
 
-export default function LiveChart({ data, livePrice, levels, trends, indicators, enabledIndicators, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
+export default function LiveChart({ data, levels, trends, indicators, enabledIndicators, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const trendOverlayRef = useRef<SVGSVGElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -31,7 +30,6 @@ export default function LiveChart({ data, livePrice, levels, trends, indicators,
   const priceLineRef = useRef<Map<number, IPriceLine>>(new Map())
   const indicatorSeries = useRef<Map<string, ISeriesApi<'Line' | 'Histogram'>>>(new Map())
   const savedVisibleRange = useRef<{ from: number; to: number } | null>(null)
-  const currentPriceLine = useRef<IPriceLine | null>(null)
   const pendingTrend = useRef<Trend['start'] | null>(null)
   const previousData = useRef<Candle[]>([])
   const hasInitializedData = useRef(false)
@@ -66,7 +64,22 @@ export default function LiveChart({ data, livePrice, levels, trends, indicators,
     })
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#1b9b73', downColor: '#e07070', borderUpColor: '#1b9b73', borderDownColor: '#e07070', wickUpColor: '#1b9b73', wickDownColor: '#e07070',
-      priceLineVisible: false, lastValueVisible: true,
+      priceLineVisible: false, lastValueVisible: false,
+      autoscaleInfoProvider: (baseImplementation: () => AutoscaleInfo | null) => {
+        const info = baseImplementation()
+        if (!info?.priceRange) return info
+        const referencePrices = levelsRef.current.filter((level) => level.id < 0).map((level) => level.price)
+        if (!referencePrices.length) return info
+        const range = info.priceRange.maxValue - info.priceRange.minValue
+        const padding = range > 0 ? range * 0.04 : Math.abs(info.priceRange.maxValue) * 0.004
+        return {
+          ...info,
+          priceRange: {
+            minValue: Math.min(info.priceRange.minValue, ...referencePrices) - padding,
+            maxValue: Math.max(info.priceRange.maxValue, ...referencePrices) + padding,
+          },
+        }
+      },
     })
     chartRef.current = chart
     seriesRef.current = series
@@ -174,7 +187,6 @@ export default function LiveChart({ data, livePrice, levels, trends, indicators,
       chart.unsubscribeDblClick(doubleClickHandler)
       chart.remove()
       priceLineMap.clear()
-      currentPriceLine.current = null
       indicatorSeriesMap.clear()
       previousData.current = []
       hasInitializedData.current = false
@@ -223,17 +235,6 @@ export default function LiveChart({ data, livePrice, levels, trends, indicators,
   }, [data, enabledIndicators])
 
   useEffect(() => {
-    const series = seriesRef.current
-    if (!series || livePrice === null) return
-    const line = currentPriceLine.current
-    if (line) {
-      line.applyOptions({ price: livePrice, title: '最新成交价' })
-    } else {
-      currentPriceLine.current = series.createPriceLine({ price: livePrice, color: '#2487e8', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '最新成交价' })
-    }
-  }, [enabledIndicators, livePrice])
-
-  useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
     const rows: Record<string, Array<{ time: number; value: number; color?: string }>> = {
@@ -269,7 +270,8 @@ export default function LiveChart({ data, livePrice, levels, trends, indicators,
     for (const line of priceLineRef.current.values()) series.removePriceLine(line)
     priceLineRef.current.clear()
     for (const level of levels) {
-      const line = series.createPriceLine({ price: level.price, color: level.color, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: `${level.label} ${level.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}` })
+      const isRiskLevel = /止损|止盈|入场/.test(level.label)
+      const line = series.createPriceLine({ price: level.price, color: level.color, lineWidth: isRiskLevel ? 2 : 1, lineStyle: isRiskLevel ? LineStyle.Dashed : LineStyle.Dotted, axisLabelVisible: true, title: `${level.label} ${level.price.toLocaleString(undefined, { maximumFractionDigits: 8 })}` })
       priceLineRef.current.set(level.id, line)
     }
     setRevision((value) => value + 1)

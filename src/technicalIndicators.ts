@@ -105,42 +105,84 @@ function rsiValues(closes: number[], period: number) {
   }
   let averageGain = gains / period
   let averageLoss = losses / period
-  values[period] = averageLoss === 0 ? 100 : 100 - 100 / (1 + averageGain / averageLoss)
+  values[period] = averageGain === 0 && averageLoss === 0 ? 50 : averageLoss === 0 ? 100 : averageGain === 0 ? 0 : 100 - 100 / (1 + averageGain / averageLoss)
   for (let index = period + 1; index < closes.length; index += 1) {
     const change = closes[index] - closes[index - 1]
     averageGain = (averageGain * (period - 1) + Math.max(change, 0)) / period
     averageLoss = (averageLoss * (period - 1) + Math.max(-change, 0)) / period
-    values[index] = averageLoss === 0 ? 100 : 100 - 100 / (1 + averageGain / averageLoss)
+    values[index] = averageGain === 0 && averageLoss === 0 ? 50 : averageLoss === 0 ? 100 : averageGain === 0 ? 0 : 100 - 100 / (1 + averageGain / averageLoss)
   }
   return values
 }
 
 function adxValues(candles: IndicatorCandle[], period: number) {
-  const tr = trueRanges(candles)
-  const plus: number[] = []
-  const minus: number[] = []
-  for (let index = 0; index < candles.length; index += 1) {
-    const previous = candles[index - 1]
-    if (!previous) { plus.push(0); minus.push(0); continue }
-    const up = candles[index].high - previous.high
-    const down = previous.low - candles[index].low
-    plus.push(up > down && up > 0 ? up : 0)
-    minus.push(down > up && down > 0 ? down : 0)
-  }
   const result: Array<number | null> = Array(candles.length).fill(null)
   const plusValues: Array<number | null> = Array(candles.length).fill(null)
   const minusValues: Array<number | null> = Array(candles.length).fill(null)
-  for (let index = period; index < candles.length; index += 1) {
-    const range = average(tr.slice(index - period + 1, index + 1))
-    if (!range) continue
-    const plusDi = average(plus.slice(index - period + 1, index + 1)) / range * 100
-    const minusDi = average(minus.slice(index - period + 1, index + 1)) / range * 100
+  if (candles.length <= period) return { adx: result, plusDi: plusValues, minusDi: minusValues }
+
+  const dx: Array<number | null> = Array(candles.length).fill(null)
+  let smoothedTr = 0
+  let smoothedPlus = 0
+  let smoothedMinus = 0
+  for (let index = 1; index < candles.length; index += 1) {
+    const candle = candles[index]
+    const previous = candles[index - 1]
+    const range = Math.max(candle.high - candle.low, Math.abs(candle.high - previous.close), Math.abs(candle.low - previous.close))
+    const up = candle.high - previous.high
+    const down = previous.low - candle.low
+    const positive = up > down && up > 0 ? up : 0
+    const negative = down > up && down > 0 ? down : 0
+    if (index <= period) {
+      smoothedTr += range
+      smoothedPlus += positive
+      smoothedMinus += negative
+    } else {
+      smoothedTr = smoothedTr - smoothedTr / period + range
+      smoothedPlus = smoothedPlus - smoothedPlus / period + positive
+      smoothedMinus = smoothedMinus - smoothedMinus / period + negative
+    }
+    if (index < period || smoothedTr === 0) continue
+    const plusDi = smoothedPlus / smoothedTr * 100
+    const minusDi = smoothedMinus / smoothedTr * 100
     plusValues[index] = plusDi
     minusValues[index] = minusDi
     const denominator = plusDi + minusDi
-    result[index] = denominator ? Math.abs(plusDi - minusDi) / denominator * 100 : 0
+    dx[index] = denominator ? Math.abs(plusDi - minusDi) / denominator * 100 : 0
+  }
+
+  const firstAdxIndex = period * 2 - 1
+  if (candles.length <= firstAdxIndex) return { adx: result, plusDi: plusValues, minusDi: minusValues }
+  let currentAdx = average(dx.slice(period, firstAdxIndex + 1).filter((value): value is number => value !== null))
+  result[firstAdxIndex] = currentAdx
+  for (let index = firstAdxIndex + 1; index < candles.length; index += 1) {
+    const currentDx = dx[index]
+    if (currentDx === null) continue
+    currentAdx = (currentAdx * (period - 1) + currentDx) / period
+    result[index] = currentAdx
   }
   return { adx: result, plusDi: plusValues, minusDi: minusValues }
+}
+
+function wilderValues(values: number[], period: number) {
+  const result: Array<number | null> = Array(values.length).fill(null)
+  if (values.length < period) return result
+  let current = average(values.slice(0, period))
+  result[period - 1] = current
+  for (let index = period; index < values.length; index += 1) {
+    current = (current * (period - 1) + values[index]) / period
+    result[index] = current
+  }
+  return result
+}
+
+function stochasticDValues(stochasticK: Array<number | null>, period: number) {
+  return stochasticK.map((value, index) => {
+    if (value === null || index < period - 1) return null
+    const window = stochasticK.slice(index - period + 1, index + 1)
+    if (window.some((item) => item === null)) return null
+    return average(window as number[])
+  })
 }
 
 export function calculateTechnicalIndicators(candles: IndicatorCandle[]): TechnicalIndicatorSet {
@@ -155,7 +197,7 @@ export function calculateTechnicalIndicators(candles: IndicatorCandle[]): Techni
   const upper = middle.map((value, index) => value === null ? null : value + 2 * Math.sqrt(average(closes.slice(Math.max(0, index - 19), index + 1).map((close) => (close - value) ** 2))))
   const lower = middle.map((value, index) => value === null ? null : value - 2 * Math.sqrt(average(closes.slice(Math.max(0, index - 19), index + 1).map((close) => (close - value) ** 2))))
   const ranges = trueRanges(candles)
-  const atrValues = smaValues(ranges, 14)
+  const atrValues = [null, ...wilderValues(ranges.slice(1), 14)]
   const rsi = rsiValues(closes, 14)
   const ema12 = emaValues(closes, 12)
   const ema26 = emaValues(closes, 26)
@@ -170,7 +212,7 @@ export function calculateTechnicalIndicators(candles: IndicatorCandle[]): Techni
     const low = Math.min(...lows.slice(index - 13, index + 1))
     return high === low ? 50 : (close - low) / (high - low) * 100
   })
-  const stochasticD = smaValues(stochasticK.map((value) => value ?? 50), 3).map((value, index) => stochasticK[index] === null ? null : value)
+  const stochasticD = stochasticDValues(stochasticK, 3)
   const vwapValues: Array<number | null> = []
   let cumulativeVolume = 0
   let cumulativePriceVolume = 0

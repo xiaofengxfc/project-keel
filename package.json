@@ -9,7 +9,7 @@
     "dev:server": "tsx server/index.ts",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "tsx --test tests/marketAnalysis.test.ts",
+    "test": "tsx --test tests/marketAnalysis.test.ts tests/orderFeatures.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

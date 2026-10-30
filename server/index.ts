@@ -1,8 +1,10 @@
 import crypto from 'node:crypto'
+import { isIP } from 'node:net'
 import 'dotenv/config'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
-import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols'
+import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
+import { isMarketExecution, isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
 
 const app = Fastify({ logger: true })
 const apiKey = process.env.BINANCE_API_KEY ?? ''
@@ -50,6 +52,21 @@ app.get('/api/health', async () => ({
   publicMarketAvailable: true,
   environment: 'binance-usdm-futures',
 }))
+
+app.get('/api/network/ip', async (_request, reply) => {
+  const endpoints = ['https://checkip.amazonaws.com', 'https://api.ipify.org?format=json', 'https://ifconfig.me/ip', 'https://icanhazip.com']
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint, { signal: AbortSignal.timeout(4000) })
+      if (!response.ok) continue
+      const body = await response.text()
+      let address = body.trim()
+      if (address.startsWith('{')) address = (JSON.parse(address) as { ip?: string }).ip?.trim() ?? ''
+      if (isIP(address)) return { ip: address }
+    } catch { /* 单个公网检测源不可用时，继续尝试备用源。 */ }
+  }
+  return reply.code(502).send({ error: '公网 IP 检测源暂不可用，请稍后重试' })
+})
 
 app.get<{ Querystring: { symbol?: string; interval?: string; limit?: string; endTime?: string } }>('/api/market/klines', async (request, reply) => {
   const symbol = request.query.symbol?.toUpperCase()
@@ -118,47 +135,110 @@ app.get('/api/account', async (_request, reply) => {
   }
 })
 
-app.get<{ Querystring: { symbol?: string } }>('/api/open-orders', async (request, reply) => {
+app.get('/api/positions', async (_request, reply) => {
   try {
-    return await binanceRequest('GET', '/fapi/v1/openOrders', { symbol: request.query.symbol?.toUpperCase() }, true)
+    return await binanceRequest('GET', '/fapi/v2/positionRisk', {}, true)
+  } catch (error) {
+    return reply.code(503).send({ error: error instanceof Error ? error.message : '读取持仓失败' })
+  }
+})
+
+app.get('/api/account/position-mode', async (_request, reply) => {
+  try {
+    return await binanceRequest('GET', '/fapi/v1/positionSide/dual', {}, true)
+  } catch (error) {
+    return reply.code(503).send({ error: error instanceof Error ? error.message : '读取持仓模式失败' })
+  }
+})
+
+app.post<{ Body: { symbol?: string; leverage?: number } }>('/api/account/leverage', async (request, reply) => {
+  if (!tradingEnabled) return reply.code(403).send({ error: '杠杆设置已关闭，请先启用实盘交易安全开关' })
+  const symbol = request.body?.symbol?.toUpperCase()
+  const leverage = Number(request.body?.leverage)
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  if (!Number.isInteger(leverage) || leverage < 1 || leverage > 125) return reply.code(400).send({ error: '杠杆必须是 1 到 125 的整数' })
+  try {
+    return await binanceRequest('POST', '/fapi/v1/leverage', { symbol, leverage }, true)
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '更新杠杆失败' })
+  }
+})
+
+app.post<{ Body: { symbol?: string; marginType?: string } }>('/api/account/margin-type', async (request, reply) => {
+  if (!tradingEnabled) return reply.code(403).send({ error: '保证金模式设置已关闭，请先启用实盘交易安全开关' })
+  const symbol = request.body?.symbol?.toUpperCase()
+  const marginType = request.body?.marginType
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  if (marginType !== 'CROSSED' && marginType !== 'ISOLATED') return reply.code(400).send({ error: '保证金模式只能是全仓或逐仓' })
+  try {
+    return await binanceRequest('POST', '/fapi/v1/marginType', { symbol, marginType }, true)
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? error.message : '更新保证金模式失败' })
+  }
+})
+
+app.get<{ Querystring: { symbol?: string } }>('/api/open-orders', async (request, reply) => {
+  const symbol = request.query.symbol?.toUpperCase()
+  if (symbol && !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
+  try {
+    return await binanceRequest('GET', '/fapi/v1/openOrders', { symbol }, true)
   } catch (error) {
     return reply.code(503).send({ error: error instanceof Error ? error.message : '读取当前委托失败' })
   }
 })
 
-type OrderBody = {
-  symbol: string
-  side: 'BUY' | 'SELL'
-  type: 'LIMIT' | 'MARKET' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET'
-  quantity?: string
-  price?: string
-  stopPrice?: string
-  reduceOnly?: boolean
-}
+app.get<{ Querystring: { symbol?: string; limit?: string; orderId?: string } }>('/api/order-history', async (request, reply) => {
+  const symbol = request.query.symbol?.toUpperCase()
+  const limit = Math.min(Math.max(Number(request.query.limit ?? 50), 1), 1000)
+  const orderId = request.query.orderId
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '历史订单查询需要有效的交易对' })
+  if (!Number.isInteger(limit)) return reply.code(400).send({ error: 'limit 必须是 1 到 1000 的整数' })
+  try {
+    return await binanceRequest('GET', '/fapi/v1/allOrders', { symbol, limit, orderId }, true)
+  } catch (error) {
+    return reply.code(503).send({ error: error instanceof Error ? error.message : '读取历史订单失败' })
+  }
+})
+
+type OrderBody = BinanceOrderInput
 
 app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
   if (!tradingEnabled) return reply.code(403).send({ error: '实盘交易已关闭。请确认配置无误后，再在后端设置 TRADING_ENABLED=true。' })
   const body = request.body
-  if (!body?.symbol || !body.side || !body.type || !body.quantity) return reply.code(400).send({ error: 'symbol、side、type 和 quantity 为必填项' })
-  if (body.type === 'LIMIT' && (!body.price || body.price.trim() === '')) return reply.code(400).send({ error: '限价单必须填写价格' })
-  if ((body.type === 'STOP_MARKET' || body.type === 'TAKE_PROFIT_MARKET') && (!body.stopPrice || body.stopPrice.trim() === '')) return reply.code(400).send({ error: '止损或止盈单必须填写触发价格' })
+  if (!body?.symbol || !body.side || !body.type) return reply.code(400).send({ error: 'symbol、side 和 type 为必填项' })
+  const validationError = validateBinanceOrder(body)
+  if (validationError) return reply.code(400).send({ error: validationError })
   try {
-    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; tickSize?: string; minPrice?: string; maxPrice?: string; notional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
+    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; tickSize?: string; minPrice?: string; maxPrice?: string; notional?: string; minNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
     const marketSymbol = info.symbols.find((item) => item.symbol === body.symbol.toUpperCase())
     if (!marketSymbol) return reply.code(400).send({ error: '该交易对不支持 Binance USDⓈ-M Futures' })
     const filter = (type: string) => marketSymbol.filters.find((item) => item.filterType === type)
-    const qtyFilter = filter(body.type === 'MARKET' ? 'MARKET_LOT_SIZE' : 'LOT_SIZE') ?? filter('LOT_SIZE')
+    const qtyFilters = body.closePosition ? [] : [filter('LOT_SIZE'), ...(isMarketExecution(body.type) ? [filter('MARKET_LOT_SIZE')] : [])].filter((item): item is NonNullable<typeof item> => item !== undefined)
     const priceFilter = filter('PRICE_FILTER')
-    const quantity = Number(body.quantity)
-    const priceValue = Number(body.price ?? body.stopPrice)
-    if (!Number.isFinite(quantity) || quantity <= 0) return reply.code(400).send({ error: '数量必须是大于 0 的数字' })
-    if (qtyFilter?.minQty && quantity < Number(qtyFilter.minQty)) return reply.code(400).send({ error: `数量低于 Binance 最小值 (${qtyFilter.minQty})` })
-    if (qtyFilter?.maxQty && quantity > Number(qtyFilter.maxQty)) return reply.code(400).send({ error: `数量超过 Binance 最大值 (${qtyFilter.maxQty})` })
-    if (qtyFilter?.stepSize && Number(qtyFilter.stepSize) > 0 && Math.abs(quantity / Number(qtyFilter.stepSize) - Math.round(quantity / Number(qtyFilter.stepSize))) > 1e-7) return reply.code(400).send({ error: `数量必须符合 Binance 步长 (${qtyFilter.stepSize})` })
-    if (body.type !== 'MARKET' && (!Number.isFinite(priceValue) || priceValue <= 0)) return reply.code(400).send({ error: '价格必须是大于 0 的数字' })
-    if (body.type !== 'MARKET' && priceFilter?.tickSize && Math.abs(priceValue / Number(priceFilter.tickSize) - Math.round(priceValue / Number(priceFilter.tickSize))) > 1e-7) return reply.code(400).send({ error: `价格必须符合 Binance 最小变动单位 (${priceFilter.tickSize})` })
-    const params: Record<string, QueryValue> = { symbol: body.symbol.toUpperCase(), side: body.side, type: body.type, quantity: body.quantity, price: body.price, stopPrice: body.stopPrice, reduceOnly: body.reduceOnly }
-    if (body.type === 'LIMIT') params.timeInForce = 'GTC'
+    const quantity = body.quantity === undefined ? undefined : Number(body.quantity)
+    for (const qtyFilter of qtyFilters) {
+      if (quantity !== undefined && qtyFilter.minQty && Number(qtyFilter.minQty) > 0 && quantity < Number(qtyFilter.minQty)) return reply.code(400).send({ error: `数量低于 Binance 最小值 (${qtyFilter.minQty})` })
+      if (quantity !== undefined && qtyFilter.maxQty && Number(qtyFilter.maxQty) > 0 && quantity > Number(qtyFilter.maxQty)) return reply.code(400).send({ error: `数量超过 Binance 最大值 (${qtyFilter.maxQty})` })
+      if (body.quantity !== undefined && qtyFilter.stepSize && Number(qtyFilter.stepSize) > 0 && !isStepAligned(body.quantity, qtyFilter.stepSize)) return reply.code(400).send({ error: `数量必须符合 Binance 步长 (${qtyFilter.stepSize})` })
+    }
+    const prices = [body.price, body.stopPrice, body.activationPrice].filter((value): value is string => Boolean(value))
+    for (const value of prices) {
+      const number = Number(value)
+      if (priceFilter?.minPrice && Number(priceFilter.minPrice) > 0 && number < Number(priceFilter.minPrice)) return reply.code(400).send({ error: `价格低于 Binance 最小值 (${priceFilter.minPrice})` })
+      if (priceFilter?.maxPrice && Number(priceFilter.maxPrice) > 0 && number > Number(priceFilter.maxPrice)) return reply.code(400).send({ error: `价格超过 Binance 最大值 (${priceFilter.maxPrice})` })
+      if (priceFilter?.tickSize && Number(priceFilter.tickSize) > 0 && !isStepAligned(value, priceFilter.tickSize)) return reply.code(400).send({ error: `价格必须符合 Binance 最小变动单位 (${priceFilter.tickSize})` })
+    }
+    const notionalFilter = filter('MIN_NOTIONAL') ?? filter('NOTIONAL')
+    const minimumNotional = Number(notionalFilter?.notional ?? notionalFilter?.minNotional)
+    if (quantity !== undefined && minimumNotional > 0) {
+      let referencePrice = Number(body.price ?? body.stopPrice)
+      if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+        const ticker = await binanceRequest<{ price: string }>('GET', '/fapi/v1/ticker/price', { symbol: body.symbol.toUpperCase() })
+        referencePrice = Number(ticker.price)
+      }
+      if (Number.isFinite(referencePrice) && referencePrice > 0 && quantity * referencePrice < minimumNotional) return reply.code(400).send({ error: `订单名义价值低于 Binance 最小值 (${minimumNotional} USDT)` })
+    }
+    const params = toBinanceOrderParams(body) as Record<string, QueryValue>
     return await binanceRequest('POST', '/fapi/v1/order', params, true)
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '订单被拒绝' })
@@ -196,8 +276,10 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
 app.delete<{ Querystring: { symbol?: string; orderId?: string } }>('/api/order', async (request, reply) => {
   if (!tradingEnabled) return reply.code(403).send({ error: '本地服务器已关闭实盘交易。' })
   if (!request.query.symbol || !request.query.orderId) return reply.code(400).send({ error: 'symbol 和 orderId 为必填项' })
+  const symbol = request.query.symbol.toUpperCase()
+  if (!/^[A-Z0-9]{3,20}$/.test(symbol) || !/^\d+$/.test(request.query.orderId)) return reply.code(400).send({ error: 'symbol 或 orderId 格式无效' })
   try {
-    return await binanceRequest('DELETE', '/fapi/v1/order', { symbol: request.query.symbol.toUpperCase(), orderId: request.query.orderId }, true)
+    return await binanceRequest('DELETE', '/fapi/v1/order', { symbol, orderId: request.query.orderId }, true)
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '撤单被拒绝' })
   }
