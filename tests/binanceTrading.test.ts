@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { allowedLeverageOptions, buildCloseOrder, leverageLimitForNotional, orderSizeAtBalancePercent, quantityFromAmount } from '../src/binanceTrading.ts'
+import { allowedLeverageOptions, buildCloseOrder, leverageLimitForNotional, orderSizeAtBalancePercent, partialCloseQuantity, percentageLeverageLimit, quantityFromAmount, quoteAsset } from '../src/binanceTrading.ts'
 
 const brackets = [
   { bracket: 1, initialLeverage: 125, notionalFloor: '0', notionalCap: '50000' },
@@ -20,6 +20,14 @@ test('coin and USDT amounts convert to step aligned quantities by rounding down'
   assert.equal(quantityFromAmount(0.12345, 'asset', 100, '0.001'), '0.123')
   assert.equal(quantityFromAmount(25, 'usdt', 100, '0.001'), '0.25')
   assert.equal(quantityFromAmount(0, 'usdt', 100, '0.001'), '0')
+})
+
+test('percentage sliders respect notional bracket limits and partial close steps', () => {
+  assert.equal(percentageLeverageLimit(brackets, 1_000, 100), 50)
+  assert.equal(percentageLeverageLimit(brackets, 1_000, 25), 125)
+  assert.equal(partialCloseQuantity(1.239, 50, '0.01'), '0.61')
+  assert.equal(quoteAsset('ETHUSDT'), 'USDT')
+  assert.equal(quoteAsset('BTCUSDC'), 'USDC')
 })
 
 test('balance slider uses all available balance times leverage and rounds quantity down', () => {

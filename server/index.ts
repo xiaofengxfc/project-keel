@@ -301,8 +301,8 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
   const positionSide = request.body?.positionSide
   const stopLossProvided = typeof request.body?.stopLoss === 'string'
   const takeProfitProvided = typeof request.body?.takeProfit === 'string'
-  const stopLoss = request.body?.stopLoss?.trim() || undefined
-  const takeProfit = request.body?.takeProfit?.trim() || undefined
+  const stopLoss = typeof request.body?.stopLoss === 'string' ? request.body.stopLoss.trim() || undefined : undefined
+  const takeProfit = typeof request.body?.takeProfit === 'string' ? request.body.takeProfit.trim() || undefined : undefined
   const workingType = request.body?.workingType ?? 'CONTRACT_PRICE'
   if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
   if (!['BOTH', 'LONG', 'SHORT'].includes(positionSide ?? '')) return reply.code(400).send({ error: '请提供有效的持仓方向' })

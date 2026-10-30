@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, createSeriesMarkers, type AutoscaleInfo, type IChartApi, type IPriceLine, type ISeriesApi, type ISeriesMarkersPluginApi, type MouseEventParams, type SeriesMarker, type Time } from 'lightweight-charts'
+import { CandlestickSeries, ColorType, CrosshairMode, HistogramSeries, LineSeries, LineStyle, createChart, createSeriesMarkers, type IChartApi, type IPriceLine, type ISeriesApi, type ISeriesMarkersPluginApi, type MouseEventParams, type SeriesMarker, type Time } from 'lightweight-charts'
 import type { ChartIndicatorKey, TechnicalIndicatorSet } from './technicalIndicators'
 
 type Candle = { time: number; open: number; high: number; low: number; close: number }
@@ -10,6 +10,8 @@ type Tool = 'cursor' | 'horizontal' | 'trend'
 
 type Props = {
   data: Candle[]
+  marketKey?: string
+  currentPrice?: number | null
   trades?: Trade[]
   levels: Level[]
   trends: Trend[]
@@ -24,13 +26,14 @@ type Props = {
   onLoadOlder: () => void
 }
 
-export default function LiveChart({ data, trades = [], levels, trends, indicators, enabledIndicators, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
+export default function LiveChart({ data, marketKey = '', currentPrice = null, trades = [], levels, trends, indicators, enabledIndicators, tool, levelLabel, onAddLevel, onAddTrend, onRemoveLevel, onRemoveTrend, onLoadOlder }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const trendOverlayRef = useRef<SVGSVGElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
   const priceLineRef = useRef<Map<number, IPriceLine>>(new Map())
+  const currentPriceLineRef = useRef<IPriceLine | null>(null)
   const indicatorSeries = useRef<Map<string, ISeriesApi<'Line' | 'Histogram'>>>(new Map())
   const savedVisibleRange = useRef<{ from: number; to: number } | null>(null)
   const pendingTrend = useRef<Trend['start'] | null>(null)
@@ -68,21 +71,6 @@ export default function LiveChart({ data, trades = [], levels, trends, indicator
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#1b9b73', downColor: '#e07070', borderUpColor: '#1b9b73', borderDownColor: '#e07070', wickUpColor: '#1b9b73', wickDownColor: '#e07070',
       priceLineVisible: false, lastValueVisible: false,
-      autoscaleInfoProvider: (baseImplementation: () => AutoscaleInfo | null) => {
-        const info = baseImplementation()
-        if (!info?.priceRange) return info
-        const referencePrices = levelsRef.current.map((level) => level.price)
-        if (!referencePrices.length) return info
-        const range = info.priceRange.maxValue - info.priceRange.minValue
-        const padding = range > 0 ? range * 0.04 : Math.abs(info.priceRange.maxValue) * 0.004
-        return {
-          ...info,
-          priceRange: {
-            minValue: Math.min(info.priceRange.minValue, ...referencePrices) - padding,
-            maxValue: Math.max(info.priceRange.maxValue, ...referencePrices) + padding,
-          },
-        }
-      },
     })
     chartRef.current = chart
     seriesRef.current = series
@@ -183,8 +171,6 @@ export default function LiveChart({ data, trades = [], levels, trends, indicator
     })
     observer.observe(element)
     return () => {
-      const visibleRange = chart.timeScale().getVisibleLogicalRange()
-      if (visibleRange) savedVisibleRange.current = visibleRange
       observer.disconnect()
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
       chart.unsubscribeClick(clickHandler)
@@ -198,7 +184,7 @@ export default function LiveChart({ data, trades = [], levels, trends, indicator
       seriesRef.current = null
       markersRef.current = null
     }
-  }, [enabledIndicators])
+  }, [enabledIndicators, marketKey])
 
   useEffect(() => {
     const series = seriesRef.current
@@ -287,13 +273,41 @@ export default function LiveChart({ data, trades = [], levels, trends, indicator
     if (!series) return
     for (const line of priceLineRef.current.values()) series.removePriceLine(line)
     priceLineRef.current.clear()
-    for (const level of levels) {
-      const isRiskLevel = /止损|止盈|入场/.test(level.label)
-      const line = series.createPriceLine({ price: level.price, color: level.color, lineWidth: isRiskLevel ? 2 : 1, lineStyle: isRiskLevel ? LineStyle.Dashed : LineStyle.Dotted, axisLabelVisible: true, title: `${level.label} ${level.price.toLocaleString(undefined, { maximumFractionDigits: 8 })}` })
+    const candlePrices = data.flatMap((candle) => [candle.low, candle.high]).filter((price) => Number.isFinite(price) && price > 0)
+    if (!candlePrices.length) return
+    const minPrice = Math.min(...candlePrices)
+    const maxPrice = Math.max(...candlePrices)
+    const span = Math.max(maxPrice - minPrice, maxPrice * 0.001)
+    const visibleLevels = levels.filter((level) => Number.isFinite(level.price) && level.price > 0 && level.price >= minPrice - span * 0.15 && level.price <= maxPrice + span * 0.15)
+    const isPrimaryLabel = (level: Level) => /止损|止盈|入场|均价|强平/.test(level.label)
+    const isStructureLabel = (level: Level) => /支撑|阻力/.test(level.label)
+    const labelCandidates = [...visibleLevels].sort((left, right) => Number(isPrimaryLabel(right)) - Number(isPrimaryLabel(left)) || Number(isStructureLabel(right)) - Number(isStructureLabel(left)) || Number(right.deletable === false) - Number(left.deletable === false))
+    const labeledCoordinates: number[] = []
+    const labeledPrices = new Set<number>()
+    for (const level of labelCandidates) {
+      const coordinate = series.priceToCoordinate(level.price)
+      if (coordinate === null) continue
+      const isPrimary = isPrimaryLabel(level)
+      const isStructure = isStructureLabel(level)
+      const canLabel = (isPrimary || isStructure || level.deletable === false) && labeledCoordinates.every((existing) => Math.abs(existing - coordinate) >= 19)
+      if (canLabel) { labeledCoordinates.push(coordinate); labeledPrices.add(level.price) }
+    }
+    for (const level of visibleLevels) {
+      const isPrimary = isPrimaryLabel(level)
+      const canLabel = labeledPrices.has(level.price)
+      const line = series.createPriceLine({ price: level.price, color: level.color, lineWidth: isPrimary ? 2 : 1, lineStyle: isPrimary ? LineStyle.Dashed : canLabel ? LineStyle.Dotted : LineStyle.SparseDotted, axisLabelVisible: canLabel, title: canLabel ? `${level.label} ${level.price.toLocaleString(undefined, { maximumFractionDigits: 8 })}` : '' })
       priceLineRef.current.set(level.id, line)
     }
-    setRevision((value) => value + 1)
-  }, [enabledIndicators, levels])
+  }, [data, enabledIndicators, levels, size.height])
+
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series) return
+    if (currentPriceLineRef.current) series.removePriceLine(currentPriceLineRef.current)
+    currentPriceLineRef.current = currentPrice !== null && Number.isFinite(currentPrice) && currentPrice > 0
+      ? series.createPriceLine({ price: currentPrice, color: '#202a38', lineWidth: 1, lineStyle: LineStyle.Solid, axisLabelVisible: true, title: `当前价格 ${currentPrice.toLocaleString(undefined, { maximumFractionDigits: 8 })}` })
+      : null
+  }, [currentPrice])
 
   useEffect(() => {
     if (!data.length) return
@@ -322,7 +336,7 @@ export default function LiveChart({ data, trades = [], levels, trends, indicator
       return [line]
     })
     overlay.replaceChildren(...lines)
-  }, [data, enabledIndicators, revision, size, trends])
+  }, [data, enabledIndicators, levels, revision, size, trends])
 
   return <div className={`live-chart ${tool !== 'cursor' ? 'drawing' : ''}`} ref={host} data-level-label={levelLabel} data-chart-width={size.width} data-redraw={revision}>
     <svg ref={trendOverlayRef} className="trend-overlay" width={size.width} height={size.height} aria-hidden="true" />
