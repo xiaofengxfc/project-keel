@@ -5,6 +5,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
 import { isMarketExecution, isStepAligned, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
+import { protectionOrderDirection } from '../src/binanceTrading.js'
 import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
 
 const app = Fastify({ logger: true })
@@ -312,11 +313,12 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
   if (!['MARK_PRICE', 'CONTRACT_PRICE'].includes(workingType)) return reply.code(400).send({ error: '触发参考价格无效' })
   try {
     const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v2/positionRisk', { symbol }, true)
-    const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide)
+    const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide && Number.isFinite(Number(row.positionAmt)) && Number(row.positionAmt) !== 0)
     const amount = Number(position?.positionAmt)
-    if (position && (!Number.isFinite(amount) || amount === 0)) return reply.code(400).send({ error: '该方向当前没有持仓' })
     if (!position && !request.body?.side) return reply.code(400).send({ error: '没有持仓时需要提供保护单方向' })
-    const side = position ? amount > 0 ? 'SELL' : 'BUY' : request.body!.side!
+    const direction = protectionOrderDirection(positionSide!, position ? amount : null, request.body?.side as 'BUY' | 'SELL' | undefined)
+    if (!direction) return reply.code(400).send({ error: position ? '保护单方向与当前持仓方向不匹配' : '保护单方向与持仓模式不匹配' })
+    const { side, isLong } = direction
     const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; tickSize?: string; minPrice?: string; maxPrice?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
     const priceFilter = info.symbols.find((item) => item.symbol === symbol)?.filters.find((item) => item.filterType === 'PRICE_FILTER')
     for (const value of [stopLoss, takeProfit]) {
@@ -327,7 +329,6 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
       if (priceFilter?.tickSize && Number(priceFilter.tickSize) > 0 && !isStepAligned(value, priceFilter.tickSize)) return reply.code(400).send({ error: `价格必须符合 Binance 最小变动单位 (${priceFilter.tickSize})` })
     }
     const markPrice = Number(position?.markPrice ?? (await binanceRequest<{ markPrice: string }>('GET', '/fapi/v1/premiumIndex', { symbol })).markPrice)
-    const isLong = position ? amount > 0 : positionSide === 'LONG' || positionSide === 'BOTH' && side === 'SELL'
     if (stopLoss && (isLong ? Number(stopLoss) >= markPrice : Number(stopLoss) <= markPrice)) return reply.code(400).send({ error: isLong ? '多仓止损价必须低于标记价格' : '空仓止损价必须高于标记价格' })
     if (takeProfit && (isLong ? Number(takeProfit) <= markPrice : Number(takeProfit) >= markPrice)) return reply.code(400).send({ error: isLong ? '多仓止盈价必须高于标记价格' : '空仓止盈价必须低于标记价格' })
     const [standardOrders, algoOrders] = await Promise.all([

@@ -21,6 +21,12 @@ export function percentageLeverageLimit(brackets: LeverageBracket[], balance: nu
   return limit
 }
 
+export function leverageForBalancePercent(brackets: LeverageBracket[], balance: number, percent: number, requestedLeverage: number) {
+  const requested = Math.max(1, Math.floor(Number.isFinite(requestedLeverage) ? requestedLeverage : 1))
+  const maximum = percentageLeverageLimit(brackets, balance, percent)
+  return { maximum, effective: maximum > 0 ? Math.min(requested, maximum) : requested, clamped: maximum > 0 && requested > maximum }
+}
+
 export function quantityAtPercent(balance: number, leverage: number, percent: number, price: number, stepSize: string): string {
   return orderSizeAtBalancePercent(balance, leverage, percent, price, stepSize, 'asset').quantity
 }
@@ -76,4 +82,15 @@ export function buildCloseOrder(position: { positionAmt: number; positionSide: s
     reduceOnly: positionSide === 'BOTH',
     quantity: String(Math.abs(position.positionAmt)),
   }
+}
+
+export function protectionOrderDirection(positionSide: string, positionAmount: number | null, requestedSide?: 'BUY' | 'SELL') {
+  const hasPosition = positionAmount !== null && Number.isFinite(positionAmount) && positionAmount !== 0
+  if (hasPosition) {
+    const isLong = positionSide === 'LONG' || positionSide === 'BOTH' && positionAmount! > 0
+    const side = isLong ? 'SELL' as const : 'BUY' as const
+    return requestedSide && requestedSide !== side ? null : { side, isLong }
+  }
+  if (!requestedSide || positionSide === 'LONG' && requestedSide !== 'SELL' || positionSide === 'SHORT' && requestedSide !== 'BUY') return null
+  return { side: requestedSide, isLong: positionSide === 'LONG' || positionSide === 'BOTH' && requestedSide === 'SELL' }
 }

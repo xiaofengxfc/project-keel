@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { allowedLeverageOptions, buildCloseOrder, leverageLimitForNotional, orderSizeAtBalancePercent, partialCloseQuantity, percentageLeverageLimit, quantityFromAmount, quoteAsset } from '../src/binanceTrading.ts'
+import { allowedLeverageOptions, buildCloseOrder, leverageForBalancePercent, leverageLimitForNotional, orderSizeAtBalancePercent, partialCloseQuantity, percentageLeverageLimit, protectionOrderDirection, quantityFromAmount, quoteAsset } from '../src/binanceTrading.ts'
 
 const brackets = [
   { bracket: 1, initialLeverage: 125, notionalFloor: '0', notionalCap: '50000' },
@@ -30,6 +30,11 @@ test('percentage sliders respect notional bracket limits and partial close steps
   assert.equal(quoteAsset('BTCUSDC'), 'USDC')
 })
 
+test('order slider caps leverage at the requested notional tier', () => {
+  assert.deepEqual(leverageForBalancePercent(brackets, 1_000, 100, 125), { maximum: 50, effective: 50, clamped: true })
+  assert.deepEqual(leverageForBalancePercent(brackets, 1_000, 25, 50), { maximum: 125, effective: 50, clamped: false })
+})
+
 test('balance slider uses all available balance times leverage and rounds quantity down', () => {
   assert.deepEqual(orderSizeAtBalancePercent(100, 10, 100, 250, '0.001', 'asset'), {
     quantity: '4', notional: 1000, inputAmount: 4,
@@ -47,4 +52,13 @@ test('close order direction and reduce-only params match one-way and hedge posit
     side: 'BUY', positionSide: 'SHORT', reduceOnly: false, quantity: '3',
   })
   assert.equal(buildCloseOrder({ positionAmt: 0, positionSide: 'BOTH' }), null)
+})
+
+test('protection orders use the actual position direction or the requested opening direction', () => {
+  assert.deepEqual(protectionOrderDirection('BOTH', 2, 'SELL'), { side: 'SELL', isLong: true })
+  assert.deepEqual(protectionOrderDirection('SHORT', -2, 'BUY'), { side: 'BUY', isLong: false })
+  assert.deepEqual(protectionOrderDirection('BOTH', null, 'SELL'), { side: 'SELL', isLong: true })
+  assert.deepEqual(protectionOrderDirection('LONG', null, 'SELL'), { side: 'SELL', isLong: true })
+  assert.equal(protectionOrderDirection('SHORT', null, 'SELL'), null)
+  assert.equal(protectionOrderDirection('BOTH', 2, 'BUY'), null)
 })
