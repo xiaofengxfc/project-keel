@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
+import { resolve } from 'node:path'
 import 'dotenv/config'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
@@ -203,6 +206,20 @@ app.get('/api/market/symbols', async (_request, reply) => {
 
 type PredictionCandleInput = { time?: number; open?: number; high?: number; low?: number; close?: number; volume?: number }
 type PredictionRequestBody = { symbol?: string; interval?: string; candles?: PredictionCandleInput[]; horizonBars?: number }
+type PredictionTrainingMetrics = { accuracy?: number; brier?: number; testSamples?: number }
+type PredictionTrainingJob = {
+  running: boolean
+  phase: 'idle' | 'running' | 'completed' | 'failed'
+  output: string
+  error: string | null
+  startedAt: number | null
+  finishedAt: number | null
+  interval?: string
+  symbols?: string[]
+  metrics?: PredictionTrainingMetrics
+}
+let predictionTrainingJob: PredictionTrainingJob = { running: false, phase: 'idle', output: '', error: null, startedAt: null, finishedAt: null }
+let predictionTrainingProcess: ChildProcess | null = null
 
 app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, reply) => {
   if (!predictionEnabled) return reply.code(503).send({ error: '本地预测模型已被配置关闭，请设置 PREDICTION_ENABLED=true 后重启后端。' })
@@ -251,6 +268,80 @@ app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, rep
   } catch (error) {
     if (error instanceof DOMException && error.name === 'TimeoutError') return reply.code(504).send({ error: `预测模型响应超时（${Math.round(predictionTimeoutMs / 1000)} 秒）` })
     return reply.code(503).send({ error: error instanceof Error ? `预测服务不可用：${error.message}` : '预测服务不可用' })
+  }
+})
+
+app.get('/api/prediction/train/status', async () => predictionTrainingJob)
+
+app.post<{ Body: { interval?: string; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
+  if (predictionTrainingJob.running) return reply.code(409).send({ error: '模型训练正在运行，请等待完成。' })
+  const interval = request.body?.interval
+  if (!interval || !['15m', '1h', '4h', '1d'].includes(interval)) return reply.code(400).send({ error: '请选择有效周期：15m、1h、4h 或 1d。' })
+  if (!Array.isArray(request.body?.symbols)) return reply.code(400).send({ error: '请提供至少两个交易对。' })
+  const symbols = [...new Set(request.body.symbols.map((symbol) => String(symbol).trim().toUpperCase()))]
+  if (symbols.length < 2 || symbols.length > 30 || symbols.some((symbol) => !/^[A-Z0-9]{3,20}$/.test(symbol))) {
+    return reply.code(400).send({ error: '通用模型需选择 2 到 30 个有效交易对。' })
+  }
+  const pythonPath = process.env.PREDICTION_PYTHON
+    ?? (existsSync(resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'))
+      ? resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+      : 'python')
+  predictionTrainingJob = { running: true, phase: 'running', output: '', error: null, startedAt: Date.now(), finishedAt: null, interval, symbols }
+  try {
+    const child = spawn(pythonPath, ['-m', 'prediction.auto_train', '--symbols', symbols.join(','), '--interval', interval], {
+      cwd: process.cwd(),
+      windowsHide: true,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    predictionTrainingProcess = child
+    const appendOutput = (chunk: Buffer | string) => {
+      predictionTrainingJob.output = `${predictionTrainingJob.output}${chunk.toString()}`.slice(-12_000)
+    }
+    child.stdout?.on('data', appendOutput)
+    child.stderr?.on('data', appendOutput)
+    child.on('error', (error) => {
+      predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: error.message, finishedAt: Date.now() }
+      predictionTrainingProcess = null
+    })
+    child.on('close', async (code) => {
+      if (predictionTrainingProcess !== child) return
+      predictionTrainingProcess = null
+      if (code !== 0) {
+        predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: `训练进程退出，代码 ${code ?? '未知'}`, finishedAt: Date.now() }
+        return
+      }
+      try {
+        const modelRoot = resolve(process.env.PREDICTION_MODEL_DIR ?? 'prediction/models')
+        const metadata = JSON.parse(await readFile(resolve(modelRoot, interval, 'metadata.json'), 'utf8')) as { symbol?: string; interval?: string; metrics?: PredictionTrainingMetrics }
+        if (metadata.symbol !== '*' || metadata.interval !== interval) throw new Error('训练产物不是预期的通用周期模型')
+        let reloadNotice = ''
+        try {
+          const predictionUrl = new URL(predictionServiceUrl)
+          if (['127.0.0.1', 'localhost', '[::1]'].includes(predictionUrl.hostname)) {
+            const reloadUrl = new URL('/reload', predictionUrl)
+            const response = await fetch(reloadUrl, { method: 'POST', signal: AbortSignal.timeout(5000) })
+            if (!response.ok) reloadNotice = '模型已保存；本地推理服务未能热加载，请重启预测服务。'
+          }
+        } catch { reloadNotice = '模型已保存；本地推理服务未能热加载，请重启预测服务。' }
+        predictionTrainingJob = {
+          ...predictionTrainingJob,
+          running: false,
+          phase: 'completed',
+          metrics: metadata.metrics,
+          error: reloadNotice || null,
+          finishedAt: Date.now(),
+          output: `${predictionTrainingJob.output}${reloadNotice ? `\n${reloadNotice}` : ''}`.slice(-12_000),
+        }
+      } catch (error) {
+        predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: error instanceof Error ? error.message : '读取训练结果失败', finishedAt: Date.now() }
+      }
+    })
+    return reply.code(202).send(predictionTrainingJob)
+  } catch (error) {
+    predictionTrainingProcess = null
+    predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: error instanceof Error ? error.message : '无法启动模型训练', finishedAt: Date.now() }
+    return reply.code(503).send({ error: predictionTrainingJob.error })
   }
 })
 

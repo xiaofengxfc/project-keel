@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .features import Candle, drop_open_candle, feature_row, normalize_candles
@@ -41,7 +41,7 @@ class ModelBundle:
         self.load_error = "模型尚未加载"
         self.load()
 
-    def load(self) -> None:
+    def load(self) -> str | None:
         metadata_path = self.model_dir / "metadata.json"
         onnx_path = self.model_dir / "direction.onnx"
         if not metadata_path.exists() or not onnx_path.exists():
@@ -87,22 +87,30 @@ class ModelState:
         self.load_error = "模型尚未加载"
         self.load()
 
-    def load(self) -> None:
+    def load(self) -> str | None:
+        loaded_bundles: dict[str, ModelBundle] = {}
         candidates: list[tuple[str, Path]] = [
             (interval, self.model_root / interval)
             for interval in ("15m", "1h", "4h", "1d")
         ]
         candidates.append(("*", self.model_root))
         for key, model_dir in candidates:
-            if key in self.bundles or not model_dir.is_dir():
+            if key in loaded_bundles or not model_dir.is_dir():
                 continue
             bundle = ModelBundle(model_dir)
             if bundle.ready:
-                self.bundles[key] = bundle
-        if self.bundles:
+                loaded_bundles[key] = bundle
+        if loaded_bundles:
+            self.bundles = {**self.bundles, **loaded_bundles}
             self.load_error = ""
+            return None
         else:
-            self.load_error = f"未找到可用模型：请在 {self.model_root} 下生成 direction.onnx 和 metadata.json"
+            # A failed hot reload must not take the last known-good model
+            # offline. Keep it available while reporting the reload failure.
+            error = f"未找到可用模型：请在 {self.model_root} 下生成 direction.onnx 和 metadata.json"
+            if not self.bundles:
+                self.load_error = error
+            return error
 
     @property
     def ready(self) -> bool:
@@ -134,6 +142,16 @@ state = ModelState()
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "ready": state.ready, "models": sorted(state.bundles), "error": state.load_error or None}
+
+
+@app.post("/reload")
+def reload_models(request: Request) -> dict[str, Any]:
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(status_code=403, detail="模型只能由本地服务重新加载")
+    error = state.load()
+    if error:
+        raise HTTPException(status_code=503, detail=error)
+    return {"ok": True, "ready": state.ready, "models": sorted(state.bundles)}
 
 
 @app.post("/predict")

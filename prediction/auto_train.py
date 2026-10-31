@@ -42,6 +42,11 @@ def main() -> None:
     if len(symbols) < 2:
         parser.error("通用模型至少需要两个交易对")
     args.data_dir.mkdir(parents=True, exist_ok=True)
+    args.model_root.mkdir(parents=True, exist_ok=True)
+    target = args.model_root / args.interval
+    backup = args.model_root / f"{args.interval}.previous"
+    if backup.exists() and not target.exists():
+        backup.rename(target)
     for symbol in symbols:
         run_module("prediction.collect_klines", [
             "--symbol", symbol, "--interval", args.interval,
@@ -49,8 +54,6 @@ def main() -> None:
             "--output", str(args.data_dir / f"{symbol}-{args.interval}.csv"),
         ])
 
-    args.model_root.mkdir(parents=True, exist_ok=True)
-    target = args.model_root / args.interval
     with tempfile.TemporaryDirectory(prefix="keel-model-") as temporary:
         candidate = Path(temporary) / args.interval
         run_module("prediction.train", [
@@ -71,12 +74,29 @@ def main() -> None:
             current_brier = metric(current, "brier", float("inf"))
             if accuracy < current_accuracy or brier > current_brier:
                 raise SystemExit(f"候选模型未优于当前模型：accuracy={accuracy:.4f}/{current_accuracy:.4f}, brier={brier:.4f}/{current_brier:.4f}")
+        # Prepare the complete candidate beside the live model first.  Moving
+        # directories is atomic on the same volume, so a failed promotion can
+        # restore the previous model instead of leaving the service without a
+        # model.
+        staged = args.model_root / f".{args.interval}.staged-{os.getpid()}"
         backup = args.model_root / f"{args.interval}.previous"
+        if staged.exists():
+            shutil.rmtree(staged)
         if backup.exists():
             shutil.rmtree(backup)
-        if target.exists():
+        shutil.copytree(candidate, staged)
+        had_target = target.exists()
+        if had_target:
             target.rename(backup)
-        shutil.copytree(candidate, target)
+        try:
+            staged.rename(target)
+        except Exception:
+            if had_target and backup.exists() and not target.exists():
+                backup.rename(target)
+            raise
+        finally:
+            if staged.exists():
+                shutil.rmtree(staged, ignore_errors=True)
         print(f"promoted global {args.interval} model: accuracy={accuracy:.4f}, brier={brier:.4f}")
 
 
