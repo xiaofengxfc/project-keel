@@ -69,6 +69,27 @@ OPENAI_MODEL=你的模型名称
 
 未配置 AI 服务时，界面会给出明确的未配置提示，不会把演示文本当作真实分析结果。
 
+## 本地预测模型（影子模式）
+
+自动分析可以读取本地 Python 推理服务。模型使用已收盘 K 线训练 LightGBM 三分类器（下跌、中性、上涨），导出 ONNX 后由 FastAPI 在本机推理；预测只展示概率和模型状态，不会自动下单。训练数据和模型文件默认被 `.gitignore` 排除，请在部署机器上重新生成。
+
+```powershell
+python -m pip install -r prediction\requirements.txt
+python -m prediction.collect_klines --symbol BTCUSDT --interval 1h --start-time 1704067200000 --output data\BTCUSDT-1h.csv
+python -m prediction.train --input data --interval 1h --horizon-bars 3 --output-dir prediction\models\1h
+$env:PREDICTION_MODEL_DIR = "prediction\models"
+python -m prediction.service
+```
+
+再在 `.env` 中启用后端代理：
+
+```env
+PREDICTION_ENABLED=true
+PREDICTION_SERVICE_URL=http://127.0.0.1:8790/predict
+```
+
+将多个交易对的 CSV 一起传给训练命令会生成通用模型，特征使用相对收益、波动率和成交量比等指标，推理时可覆盖训练数据中的交易对。每个周期要单独训练并放入 `prediction/models/<interval>`；如果只传一个 CSV 并指定交易对，则生成的模型只适用于该交易对。
+
 ## 检查命令
 
 ```bash

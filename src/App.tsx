@@ -7,12 +7,13 @@ import { isMarketExecution, isPriceOrder, isTriggeredOrder, requiresAlgoEndpoint
 import { allSymbolLeverageOptions, leverageForBalancePercent, leverageLimitForNotional, maximumLeverageForBrackets, orderSizeAtBalancePercent, partialCloseQuantity, quantityFromAmount, quoteAsset, type LeverageBracket, type OrderAmountUnit } from './binanceTrading'
 import { parseWatchlist, reorderWatchlist, WATCHLIST_STORAGE_KEY } from './watchlist'
 import { DEFAULT_ANALYSIS_INDICATORS, DEFAULT_CHART_INDICATORS, type AnalysisIndicatorKey, type ChartIndicatorKey, calculateTechnicalIndicators } from './technicalIndicators'
+import { assessPrediction, parsePrediction, type PredictionResult } from './prediction'
 
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume?: number }
 type Tool = 'cursor' | 'horizontal' | 'trend'
 type Line = { id: number; price: number; label: string; color: string; deletable?: boolean }
 type Trend = { id: number; start: { time: number; price: number }; end: { time: number; price: number } }
-type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; environment?: string; websocketBaseUrl?: string }
+type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; predictionConfigured: boolean; environment?: string; websocketBaseUrl?: string }
 type MarketQuote = { price: number; change: number }
 type Interval = '15m' | '1h' | '4h' | '1d'
 type MarketTransport = 'connecting' | 'websocket' | 'rest' | 'offline'
@@ -246,7 +247,7 @@ function App() {
   const [symbolSearch, setSymbolSearch] = useState('')
   const [mobileMarketsOpen, setMobileMarketsOpen] = useState(false)
   const [messages, setMessages] = useState<string[]>(['你好，我会结合当前行情、自动分析结果和你绘制的趋势线回答问题。'])
-  const [health, setHealth] = useState<Health>({ privateApiConfigured: false, tradingEnabled: false, aiConfigured: false })
+  const [health, setHealth] = useState<Health>({ privateApiConfigured: false, tradingEnabled: false, aiConfigured: false, predictionConfigured: false })
   const [orderMessage, setOrderMessage] = useState('')
   const [accountBalance, setAccountBalance] = useState<string | null>(null)
   const [bottomTab, setBottomTab] = useState<'positions' | 'openOrders' | 'history' | 'trades'>('positions')
@@ -274,6 +275,10 @@ function App() {
   const [ipLoading, setIpLoading] = useState(false)
   const [ipError, setIpError] = useState('')
   const [privateDataRefreshKey, setPrivateDataRefreshKey] = useState(0)
+  const [prediction, setPrediction] = useState<PredictionResult | null>(null)
+  const [predictionLoading, setPredictionLoading] = useState(false)
+  const [predictionError, setPredictionError] = useState('')
+  const predictionRequestKeyRef = useRef('')
   const historyRequestId = useRef(0)
   const tradingSettingsSymbol = useRef('')
   const tickerMessageAt = useRef<Record<string, number>>({})
@@ -756,6 +761,52 @@ function App() {
     ? { environment: '数据不足', direction: '观望', support: null, resistance: null, stopLoss: null, takeProfit: null, entry: analysisReferencePrice ?? last, status: '自动分析已关闭', rr: null, atr: null, indicatorSignals: [], supportingIndicators: 0, opposingIndicators: 0 }
     : multiTimeframeAnalysis?.byTimeframe[interval] ?? analyzeMarket(chartCandles, last, analysisIndicators)
   const analysisView = multiTimeframeAnalysis?.byTimeframe[analysisViewInterval] ?? analysis
+  const predictionCandles = useMemo(() => chartCandles.length > 1 ? chartCandles.slice(0, -1).slice(-240) : [], [chartCandles])
+  const predictionDataThrough = predictionCandles.at(-1)?.time ?? 0
+  const predictionCandlesRef = useRef<Candle[]>([])
+  useEffect(() => { predictionCandlesRef.current = predictionCandles }, [predictionCandles])
+  useEffect(() => {
+    if (!health.predictionConfigured || !analysisEnabled || !active || predictionCandles.length < 50 || !predictionDataThrough) {
+      setPrediction(null)
+      setPredictionError('')
+      setPredictionLoading(false)
+      predictionRequestKeyRef.current = ''
+      return
+    }
+    const requestKey = `${active}:${interval}:${predictionDataThrough}`
+    if (predictionRequestKeyRef.current === requestKey) return
+    predictionRequestKeyRef.current = requestKey
+    const controller = new AbortController()
+    let cancelled = false
+    const candlesForRequest = predictionCandlesRef.current
+    setPrediction(null)
+    setPredictionError('')
+    setPredictionLoading(true)
+    void fetch('/api/prediction', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({ symbol: active, interval, horizonBars: 3, candles: candlesForRequest }),
+    }).then(async (response) => {
+      const payload = await response.json() as unknown
+      if (!response.ok) {
+        const message = payload && typeof payload === 'object' ? 'error' in payload && typeof payload.error === 'string' ? payload.error : 'detail' in payload && typeof payload.detail === 'string' ? payload.detail : '预测服务不可用' : '预测服务不可用'
+        throw new Error(message)
+      }
+      const parsed = parsePrediction(payload)
+      if (!parsed) throw new Error('预测结果格式无效')
+      if (parsed.dataThrough !== predictionDataThrough) throw new Error('预测结果不是当前最新 K 线')
+      return parsed
+    }).then((result) => {
+      if (!cancelled) setPrediction(result)
+    }).catch((error: unknown) => {
+      if (!cancelled && !(error instanceof DOMException && error.name === 'AbortError')) {
+        setPredictionError(error instanceof Error ? error.message : '预测服务不可用')
+      }
+    }).finally(() => { if (!cancelled) setPredictionLoading(false) })
+    return () => { cancelled = true; controller.abort() }
+  }, [active, analysisEnabled, health.predictionConfigured, interval, predictionCandles.length, predictionDataThrough])
+  const predictionAssessment = useMemo(() => assessPrediction(prediction, analysis.direction), [analysis.direction, prediction])
   const selectedAnalysisCandles = analysisViewInterval === interval ? chartCandles : analysisCandlesByInterval[analysisViewInterval] ?? []
   const chartIndicatorValues = useMemo(() => calculateTechnicalIndicators(chartCandles), [chartCandles])
   const activeQuoteAsset = quoteAsset(active)
@@ -1100,6 +1151,18 @@ function App() {
       return <div className="timeframe-card" key={timeframe}><span>{timeframe.toUpperCase()}</span><b className={timeframeAnalysis?.direction === '做多' ? 'up' : timeframeAnalysis?.direction === '做空' ? 'down' : ''}>{timeframeAnalysis?.direction ?? '—'}</b><small>{timeframeAnalysis?.environment ?? '等待历史数据'} · {count.toLocaleString()} 根</small><small>{timeframeAnalysis?.status ?? ''}</small></div>
     })}</div>
     {multiTimeframeAnalysis && <div className="multi-timeframe-status"><b>综合：{multiTimeframeAnalysis.direction} · 一致度 {multiTimeframeAnalysis.agreement}%</b><span>{multiTimeframeAnalysis.status}</span></div>}
+    <div className="prediction-card">
+      <div className="prediction-card-head"><strong>本地预测模型 · 影子模式</strong><small>{prediction?.model ?? 'LightGBM / ONNX'}</small></div>
+      {!health.predictionConfigured ? <small className="prediction-muted">尚未启用本地预测服务。启动 Python 服务并设置 PREDICTION_ENABLED=true 后显示。</small>
+        : predictionLoading ? <small className="prediction-muted">正在计算最新已收盘 K 线的预测…</small>
+          : predictionError ? <small className="prediction-error">{predictionError}</small>
+            : prediction ? <>
+              <div className="prediction-main"><b className={prediction.direction === 'UP' ? 'up' : prediction.direction === 'DOWN' ? 'down' : ''}>{prediction.direction === 'UP' ? '偏多' : prediction.direction === 'DOWN' ? '偏空' : '中性'}</b><span>未来 {prediction.horizonBars} 根 {prediction.interval} K 线</span><strong>置信度 {Math.round(prediction.confidence * 100)}%</strong></div>
+              <div className="prediction-probabilities"><span>上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span>下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span>中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>
+              {predictionAssessment && <div className={`prediction-assessment ${predictionAssessment.state}`}><b>{predictionAssessment.label}</b><small>{predictionAssessment.detail}</small></div>}
+              <small className="prediction-meta">模型 {prediction.version} · 数据截至 {new Date(prediction.dataThrough * 1000).toLocaleString()} · 更新于 {new Date(prediction.generatedAt * 1000).toLocaleString()}</small>
+            </> : <small className="prediction-muted">等待足够的已收盘 K 线。</small>}
+    </div>
     <div className="analysis-signal-list"><strong>{analysisViewInterval.toUpperCase()} 已启用指标</strong>{analysisView.indicatorSignals.length ? analysisView.indicatorSignals.map((signal) => <div className="analysis-signal" key={`${analysisViewInterval}-${signal.key}`}><span><b>{signal.label}</b><small>{signal.reading}</small></span><span className={`signal-direction ${signal.direction}`}>{signal.direction === 'bullish' ? '偏多' : signal.direction === 'bearish' ? '偏空' : '中性'}</span><small>{signal.reason}</small></div>) : <small>自动分析关闭或当前数据不足。</small>}</div>
     <small className="analysis-detail-note">每周期最多加载 1,000 根 K 线，使用已收盘 K 线计算。高周期权重更高；多周期冲突时综合建议观望。</small>
   </div>

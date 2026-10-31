@@ -4,12 +4,13 @@ import { isIP } from 'node:net'
 import 'dotenv/config'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
-import { ProxyAgent, setGlobalDispatcher } from 'undici'
+import { Agent, ProxyAgent, setGlobalDispatcher } from 'undici'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
 import { isMarketExecution, isStepAligned, requiresAlgoEndpoint, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
 import { maximumLeverageForBrackets, protectionOrderDirection } from '../src/binanceTrading.js'
 import { replaceProtectionOrderSet, type ProtectionOrderKind, type ProtectionOrderSnapshot, type ProtectionOrderValue } from '../src/protectionOrders.js'
 import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
+import { parsePrediction, type PredictionResult } from '../src/prediction.js'
 
 const app = Fastify({ logger: true })
 const binanceConfig = getBinanceEnvironmentConfig(process.env.BINANCE_ENV, process.env.BINANCE_FUTURES_BASE_URL, process.env.BINANCE_FUTURES_WS_URL)
@@ -54,6 +55,13 @@ const configuredAiMaxTokens = Number(process.env.OPENAI_MAX_TOKENS ?? 900)
 const aiMaxTokens = Number.isFinite(configuredAiMaxTokens) && configuredAiMaxTokens >= 128
   ? Math.min(Math.round(configuredAiMaxTokens), 4_096)
   : 900
+const predictionEnabled = process.env.PREDICTION_ENABLED === 'true'
+const predictionServiceUrl = (process.env.PREDICTION_SERVICE_URL ?? 'http://127.0.0.1:8790/predict').replace(/\/$/, '')
+const configuredPredictionTimeoutMs = Number(process.env.PREDICTION_TIMEOUT_MS ?? 10_000)
+const predictionTimeoutMs = Number.isFinite(configuredPredictionTimeoutMs) && configuredPredictionTimeoutMs >= 2_000
+  ? Math.min(Math.round(configuredPredictionTimeoutMs), 30_000)
+  : 10_000
+const predictionDispatcher = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost)(?::|\/)/i.test(predictionServiceUrl) ? new Agent() : undefined
 let serverTimeOffsetMs = 0
 let serverTimeSyncAt = 0
 
@@ -108,6 +116,7 @@ app.get('/api/health', async () => ({
   privateApiConfigured: Boolean(apiKey && apiSecret),
   tradingEnabled,
   aiConfigured: Boolean(aiModel && aiBaseUrl),
+  predictionConfigured: predictionEnabled && Boolean(predictionServiceUrl),
   publicMarketAvailable: true,
   environment: binanceConfig.environment,
   websocketBaseUrl: binanceConfig.websocketBaseUrl,
@@ -186,6 +195,59 @@ app.get('/api/market/symbols', async (_request, reply) => {
     return symbols
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '读取 Binance 合约列表失败' })
+  }
+})
+
+type PredictionCandleInput = { time?: number; open?: number; high?: number; low?: number; close?: number; volume?: number }
+type PredictionRequestBody = { symbol?: string; interval?: string; candles?: PredictionCandleInput[]; horizonBars?: number }
+
+app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, reply) => {
+  if (!predictionEnabled) return reply.code(503).send({ error: '本地预测模型未启用，请启动预测服务并设置 PREDICTION_ENABLED=true。' })
+  const symbol = request.body?.symbol?.toUpperCase()
+  const interval = request.body?.interval
+  const candles = request.body?.candles
+  const horizonBars = request.body?.horizonBars ?? 3
+  if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的预测交易对' })
+  if (!interval || !['15m', '1h', '4h', '1d'].includes(interval)) return reply.code(400).send({ error: '请提供有效的预测周期' })
+  if (!Array.isArray(candles) || candles.length < 50 || candles.length > 500) return reply.code(400).send({ error: '预测至少需要 50 根、最多 500 根已收盘 K 线' })
+  if (!Number.isInteger(horizonBars) || horizonBars < 1 || horizonBars > 20) return reply.code(400).send({ error: '预测跨度必须是 1 到 20 根 K 线' })
+  const normalizedCandles = candles.map((candle) => ({
+    time: Number(candle.time),
+    open: Number(candle.open),
+    high: Number(candle.high),
+    low: Number(candle.low),
+    close: Number(candle.close),
+    volume: Number(candle.volume ?? 0),
+  }))
+  const validCandles = normalizedCandles.every((candle, index) => {
+    const previous = normalizedCandles[index - 1]
+    return Number.isFinite(candle.time) && candle.time > 0 && (!previous || candle.time > previous.time)
+      && [candle.open, candle.high, candle.low, candle.close, candle.volume].every((value) => Number.isFinite(value) && value >= 0)
+      && candle.open > 0 && candle.high >= Math.max(candle.open, candle.close, candle.low) && candle.low <= Math.min(candle.open, candle.close, candle.high)
+  })
+  if (!validCandles) return reply.code(400).send({ error: '预测 K 线数据格式无效或时间顺序错误' })
+  try {
+    const response = await fetch(predictionServiceUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(predictionTimeoutMs),
+      ...(predictionDispatcher ? { dispatcher: predictionDispatcher } : {}),
+      body: JSON.stringify({ symbol, interval, candles: normalizedCandles, horizonBars }),
+    })
+    let payload: unknown = null
+    try { payload = await response.json() } catch { /* 将由统一错误响应处理。 */ }
+    if (!response.ok) {
+      const message = payload && typeof payload === 'object'
+        ? 'error' in payload && typeof payload.error === 'string' ? payload.error : 'detail' in payload && typeof payload.detail === 'string' ? payload.detail : `预测服务返回 ${response.status}`
+        : `预测服务返回 ${response.status}`
+      return reply.code(503).send({ error: message })
+    }
+    const prediction = parsePrediction(payload)
+    if (!prediction) return reply.code(503).send({ error: '预测服务返回的数据格式无效' })
+    return prediction satisfies PredictionResult
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') return reply.code(504).send({ error: `预测模型响应超时（${Math.round(predictionTimeoutMs / 1000)} 秒）` })
+    return reply.code(503).send({ error: error instanceof Error ? `预测服务不可用：${error.message}` : '预测服务不可用' })
   }
 })
 
