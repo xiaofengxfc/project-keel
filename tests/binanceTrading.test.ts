@@ -12,6 +12,8 @@ test('leverage limit follows the symbol notional bracket', () => {
   assert.equal(leverageLimitForNotional(brackets, 60_000), 50)
   assert.equal(leverageLimitForNotional(brackets, 300_000), null)
   assert.equal(leverageLimitForNotional([], 12_000), null)
+  assert.equal(leverageLimitForNotional(brackets, Number.NaN), null)
+  assert.equal(leverageLimitForNotional(brackets, -1), null)
   assert.deepEqual(allowedLeverageOptions(brackets, 100), Array.from({ length: 125 }, (_, index) => index + 1))
   assert.ok(allowedLeverageOptions(brackets, 1_000).length <= allowedLeverageOptions(brackets, 1_000, 25).length)
 })
