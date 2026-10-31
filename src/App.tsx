@@ -15,6 +15,7 @@ type Trend = { id: number; start: { time: number; price: number }; end: { time: 
 type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; environment?: string; websocketBaseUrl?: string }
 type MarketQuote = { price: number; change: number }
 type Interval = '15m' | '1h' | '4h' | '1d'
+type MarketTransport = 'connecting' | 'websocket' | 'rest' | 'offline'
 type PositionRow = { symbol: string; positionAmt: number; entryPrice: number; markPrice: number; liquidationPrice: number; unrealizedProfit: number; leverage: number; marginType: string; positionSide: string }
 type OrderRow = { orderId: number; symbol: string; side: string; type: string; positionSide?: string; closePosition?: boolean | string; isAlgoOrder?: boolean; price: number; stopPrice: number; origQty: number; executedQty: number; status: string; time: number; updateTime: number }
 type TradeRow = { id: number; symbol: string; orderId: number; side: 'BUY' | 'SELL'; positionSide: string; price: number; qty: number; time: number }
@@ -46,20 +47,22 @@ function formatPrice(value: number | null) {
 }
 
 const KLINE_PAGE_SIZE = 1000
+const KLINE_REFRESH_MS: Record<Interval, number> = { '15m': 5_000, '1h': 8_000, '4h': 15_000, '1d': 15_000 }
+const KLINE_WATCHDOG_MS = 15_000
 const klineCache = new Map<string, { rows: unknown[][]; fetchedAt: number }>()
 const klineRequests = new Map<string, Promise<unknown[][]>>()
 
-async function requestKlines(symbol: string, interval: Interval, endTime?: number) {
-  const cacheKey = `${symbol}:${interval}:${endTime ?? 'latest'}`
+async function requestKlines(symbol: string, interval: Interval, endTime?: number, limit = KLINE_PAGE_SIZE, forceRefresh = false) {
+  const cacheKey = `${symbol}:${interval}:${endTime ?? 'latest'}:${limit}`
   const cached = klineCache.get(cacheKey)
-  if (cached && Date.now() - cached.fetchedAt < 90_000) return cached.rows
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < 90_000) return cached.rows
   const pending = klineRequests.get(cacheKey)
   if (pending) return pending
-  const params = new URLSearchParams({ symbol, interval, limit: String(KLINE_PAGE_SIZE) })
+  const params = new URLSearchParams({ symbol, interval, limit: String(Math.min(Math.max(limit, 1), KLINE_PAGE_SIZE)) })
   if (endTime !== undefined) params.set('endTime', String(endTime))
   const query = params.toString()
   const request = (async () => {
-    const response = await fetch(`/api/market/klines?${query}`)
+    const response = await fetch(`/api/market/klines?${query}`, { cache: 'no-store' })
     if (!response.ok) throw new Error(`Binance 行情请求失败：${response.status}`)
     const rows = await response.json() as unknown
     if (!Array.isArray(rows) || rows.some((row) => !Array.isArray(row) || row.length < 6)) throw new Error('Binance K 线数据格式无效')
@@ -187,7 +190,7 @@ function App() {
   const [loadingOlderCandles, setLoadingOlderCandles] = useState(false)
   const [historyError, setHistoryError] = useState('')
   const [loadedMarketKey, setLoadedMarketKey] = useState('')
-  const [connectedMarketKey, setConnectedMarketKey] = useState('')
+  const [marketTransport, setMarketTransport] = useState<MarketTransport>('connecting')
   const [loading, setLoading] = useState(false)
   const [tool, setTool] = useState<Tool>('cursor')
   const [analysisOpen, setAnalysisOpen] = useState(false)
@@ -279,8 +282,15 @@ function App() {
   const retryAfterRef = useRef(0)
   const lastMarketKeyRef = useRef('')
   const currentMarketKey = `${active}:${interval}`
-  const connected = connectedMarketKey === currentMarketKey
+  const marketAvailable = marketTransport === 'websocket' || marketTransport === 'rest'
   const marketDataIsCurrent = loadedMarketKey === currentMarketKey
+  const marketTransportLabel = marketTransport === 'websocket'
+    ? '实时行情 · Binance'
+    : marketTransport === 'rest'
+      ? 'REST 实时补偿 · Binance'
+      : marketTransport === 'offline'
+        ? '行情暂时断开'
+        : '行情连接中'
   const selected = availableSymbols.find((item) => item.symbol === active) ?? { symbol: active, name: '等待选择交易对', icon: '◆', color: '#5f6c7b' }
   const lines = storedLines[active] ?? defaultLines
   const trends = storedTrends[active] ?? []
@@ -339,7 +349,6 @@ function App() {
           setChange(null)
           setCandles([])
           setAnalysisCandlesByInterval({})
-          setConnectedMarketKey('')
           setLoadedMarketKey('')
         }
       }
@@ -407,8 +416,12 @@ function App() {
     const requestId = ++historyRequestId.current
     let cancelled = false
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    let watchdogTimer: number | undefined
     let socket: WebSocket | null = null
     let reconnectAttempt = 0
+    let lastKlineMessageAt = 0
+    let socketOpenedAt = 0
     const symbolChanged = lastMarketKeyRef.current.split(':')[0] !== active
     if (lastMarketKeyRef.current !== currentMarketKey) {
       lastMarketKeyRef.current = currentMarketKey
@@ -424,6 +437,7 @@ function App() {
       setLoadingOlderCandles(false)
       setHistoryError('')
     }
+    setMarketTransport('connecting')
     loadingOlderRef.current = false
     hasOlderRef.current = true
     retryAfterRef.current = 0
@@ -437,6 +451,24 @@ function App() {
         return [...merged.values()].sort((left, right) => left.time - right.time)
       })
     }
+    const refreshLatestCandles = async () => {
+      try {
+        const rows = await requestKlines(active, interval, undefined, 2, true)
+        if (cancelled) return
+        mergeCandles(parseKlines(rows), true)
+        setAutoTimeframeReady(true)
+        const lastKlineAt = lastKlineMessageAt || socketOpenedAt
+        if (!lastKlineAt || Date.now() - lastKlineAt >= KLINE_WATCHDOG_MS) setMarketTransport('rest')
+      } catch {
+        const lastKlineAt = lastKlineMessageAt || socketOpenedAt
+        if (!cancelled && (!lastKlineAt || Date.now() - lastKlineAt >= KLINE_WATCHDOG_MS)) setMarketTransport('offline')
+      } finally {
+        if (!cancelled) {
+          if (refreshTimer) clearTimeout(refreshTimer)
+          refreshTimer = setTimeout(refreshLatestCandles, KLINE_REFRESH_MS[interval])
+        }
+      }
+    }
     requestKlines(active, interval)
       .then((rows) => { if (!cancelled) { const parsed = parseKlines(rows); mergeCandles(parsed); hasOlderRef.current = parsed.length === KLINE_PAGE_SIZE; setHasOlderCandles(hasOlderRef.current); setLoadedMarketKey(currentMarketKey); setAutoTimeframeReady(true) } })
       .catch(() => { if (!cancelled) setCandles([]) })
@@ -449,7 +481,12 @@ function App() {
     const connect = () => {
       if (cancelled || !streamUrl) return
       socket = new WebSocket(streamUrl)
-      socket.onopen = () => { reconnectAttempt = 0; if (!cancelled) setConnectedMarketKey(currentMarketKey) }
+      socket.onopen = () => {
+        reconnectAttempt = 0
+        socketOpenedAt = Date.now()
+        lastKlineMessageAt = 0
+        if (!cancelled) setMarketTransport('connecting')
+      }
       socket.onmessage = (event) => {
         try {
           const envelope = JSON.parse(event.data) as { data?: { e?: string; s?: string; c?: string; P?: string; k?: { s?: string; i?: string; t: number; o: string; h: string; l: string; c: string; v?: string } }; s?: string; c?: string; P?: string; k?: { s?: string; i?: string; t: number; o: string; h: string; l: string; c: string; v?: string } }
@@ -457,6 +494,10 @@ function App() {
           if (data.k) {
             // 只接收当前交易对和周期，按开盘时间更新正在形成的K线。
             if (data.k.s?.toUpperCase() !== active || data.k.i !== interval) return
+            lastKlineMessageAt = Date.now()
+            if (!cancelled) {
+              setMarketTransport('websocket')
+            }
             mergeCandles([{ time: data.k.t / 1000, open: Number(data.k.o), high: Number(data.k.h), low: Number(data.k.l), close: Number(data.k.c), volume: Number(data.k.v ?? 0) }], true)
             return
           }
@@ -469,19 +510,34 @@ function App() {
           }
         } catch { /* 忽略无法解析的行情消息，等待下一条推送。 */ }
       }
-      socket.onerror = () => { if (!cancelled) setConnectedMarketKey((key) => key === currentMarketKey ? '' : key) }
+      socket.onerror = () => { if (!cancelled) setMarketTransport('rest') }
       socket.onclose = () => {
         if (cancelled) return
-        setConnectedMarketKey((key) => key === currentMarketKey ? '' : key)
-        // 断线后先用 REST 补齐最近K线，再指数退避重连 WebSocket。
-        requestKlines(active, interval).then((rows) => { if (cancelled) return; mergeCandles(parseKlines(rows)); setAutoTimeframeReady(true) }).catch(() => undefined)
+        setMarketTransport('rest')
+        // 断线后先用强制 REST 请求补齐最近 K 线，再指数退避重连 WebSocket。
+        if (refreshTimer) clearTimeout(refreshTimer)
+        void refreshLatestCandles()
         reconnectAttempt += 1
         const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempt, 5))
         reconnectTimer = setTimeout(connect, delay)
       }
     }
     connect()
-    return () => { cancelled = true; if (reconnectTimer) clearTimeout(reconnectTimer); socket?.close(); if (requestId === historyRequestId.current) historyRequestId.current += 1 }
+    void refreshLatestCandles()
+    watchdogTimer = window.setInterval(() => {
+      const lastKlineAt = lastKlineMessageAt || socketOpenedAt
+      if (cancelled || !lastKlineAt || Date.now() - lastKlineAt < KLINE_WATCHDOG_MS) return
+      setMarketTransport('rest')
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close()
+    }, 3000)
+    return () => {
+      cancelled = true
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      if (refreshTimer) clearTimeout(refreshTimer)
+      if (watchdogTimer) window.clearInterval(watchdogTimer)
+      socket?.close()
+      if (requestId === historyRequestId.current) historyRequestId.current += 1
+    }
   }, [active, availableSymbols, currentMarketKey, health.websocketBaseUrl, interval, watchlist])
 
   useEffect(() => {
@@ -1061,7 +1117,7 @@ function App() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><div className="brand-mark">K</div><div><strong>KEEL</strong><span>TRADING DESK</span></div></div>
-      <div className="top-actions"><div className={`connection ${connected ? 'online' : ''}`}><i />{connected ? `Binance ${health.environment === 'testnet' ? '测试网' : '正式网'} 已连接` : active ? '正在连接 Binance' : '请先收藏币种'}</div><button type="button" className="icon-btn ip-check" title="检测后端访问 Binance 使用的公网出口 IP" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `出口 IP ${publicIp}` : '检测出口 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
+      <div className="top-actions"><div className={`connection ${marketAvailable ? 'online' : ''}`}><i />{marketTransport === 'websocket' ? `Binance ${health.environment === 'testnet' ? '测试网' : '正式网'} 已连接` : marketTransport === 'rest' ? 'Binance REST 行情补偿中' : active ? '正在连接 Binance' : '请先收藏币种'}</div><button type="button" className="icon-btn ip-check" title="检测后端访问 Binance 使用的公网出口 IP" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `出口 IP ${publicIp}` : '检测出口 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
     </header>
     <main className="workspace">
       <MarketList
@@ -1081,7 +1137,7 @@ function App() {
         onMoveFavorite={moveFavorite}
         onReorder={(from, over) => setWatchlist((current) => reorderWatchlist(current, from, over))}
       />
-      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><button type="button" className="auto-analysis-label" onClick={() => { setAnalysisViewInterval(interval); setAnalysisOpen(true) }} disabled={!active}>自动分析 · {analysisEnabled ? analysis.environment : '已关闭'}<span>⌄</span></button><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<button className={autoTimeframe ? 'auto-time-active' : ''} title="自动：先用 1h 识别；需要细看震荡或突破时切至 15m，并保持该周期，直到手动选择、重新点击自动或切换交易对" onClick={() => { setAutoTimeframe(true); setAutoTimeframeReady(interval === '1h' && !loading && candles.length >= 35); setInterval('1h') }}>自动</button><span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setAnalysisEnabled((enabled) => !enabled); setMoreActionsOpen(false) }}>{analysisEnabled ? '关闭自动分析' : '开启自动分析'}</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setAnalysisIndicators(DEFAULT_ANALYSIS_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}<div className="analysis-summary"><span className="regime-badge">{analysis.environment}</span><span className={`direction-badge ${analysis.direction === '做多' ? 'long' : analysis.direction === '做空' ? 'short' : ''}`}>{analysis.direction}</span><span className="analysis-status">{analysis.status}</span><b>支撑 {formatPrice(analysis.support)} · 阻力 {formatPrice(analysis.resistance)}</b><b>止损 {formatPrice(analysis.stopLoss)} · 止盈 {formatPrice(analysis.takeProfit)}</b><b>参考盈亏比 {analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</b></div>{multiTimeframeAnalysis && <div className="multitimeframe-strip"><strong>多周期 · {multiTimeframeAnalysis.direction} · {multiTimeframeAnalysis.agreement}% 一致</strong><span>{multiTimeframeAnalysis.status}</span>{intervals.map((timeframe) => { const item = multiTimeframeAnalysis.byTimeframe[timeframe]; return <span key={timeframe} className="multitimeframe-item"><b>{timeframe.toUpperCase()}</b> {item.direction} · {item.environment}</span> })}</div>}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small>{hiddenAnalysisLineIds.length > 0 && <button type="button" className="restore-analysis-lines" onClick={restoreAnalysisLines}>恢复自动标注</button>}<span className="toolbar-spacer" /><span className={`chart-status ${connected ? 'online' : ''}`}><i />{connected ? '实时行情 · Binance · ' + chartPaneCount + ' 个指标窗' : '行情连接中'}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}><LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期 · 震荡/突破时切至 15m 并保持' : '手动周期'} · 自动分析线 · Binance USDⓈ-M · {connected ? '实时' : '等待连接'}</span></div>{analysisOpen && <div className="analysis-modal-backdrop" onClick={() => setAnalysisOpen(false)}><div className="analysis-modal" role="dialog" aria-modal="true" aria-label="自动市场分析" onClick={(event) => event.stopPropagation()}><div className="analysis-modal-head"><div><span className="eyebrow">MARKET READ</span><h3>{active.replace(activeQuoteAsset, `/${activeQuoteAsset}`)} · {analysisViewInterval.toUpperCase()}</h3></div><button type="button" onClick={() => setAnalysisOpen(false)} aria-label="关闭">×</button></div><div className="analysis-modal-state"><span className={`direction-badge ${analysisView.direction === '做多' ? 'long' : analysisView.direction === '做空' ? 'short' : ''}`}>{analysisView.direction}</span><b>{analysisView.environment}</b></div><p>{analysisView.status}</p><div className="analysis-values"><div><small>参考入场</small><b>{formatPrice(analysisView.entry)}</b></div><div><small>支撑位</small><b>{formatPrice(analysisView.support)}</b></div><div><small>阻力位</small><b>{formatPrice(analysisView.resistance)}</b></div><div><small>止损</small><b>{formatPrice(analysisView.stopLoss)}</b></div><div><small>止盈</small><b>{formatPrice(analysisView.takeProfit)}</b></div><div><small>参考盈亏比</small><b>{analysisView.rr === null ? '—' : `1:${analysisView.rr.toFixed(1)}`}</b></div></div>{analysisDetailPanel}<button className="ai-analysis-action" onClick={callAiAnalysis} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? 'AI 正在分析…' : '✦ 调用 AI 助手分析'}</button><div className="analysis-modal-foot">依据已收盘 K 线自动计算；分析线只作参考，不会自动下单。{!health.aiConfigured && <span> AI 服务未配置。</span>}</div></div></div>}</section>
+      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><button type="button" className="auto-analysis-label" onClick={() => { setAnalysisViewInterval(interval); setAnalysisOpen(true) }} disabled={!active}>自动分析 · {analysisEnabled ? analysis.environment : '已关闭'}<span>⌄</span></button><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<button className={autoTimeframe ? 'auto-time-active' : ''} title="自动：先用 1h 识别；需要细看震荡或突破时切至 15m，并保持该周期，直到手动选择、重新点击自动或切换交易对" onClick={() => { setAutoTimeframe(true); setAutoTimeframeReady(interval === '1h' && !loading && candles.length >= 35); setInterval('1h') }}>自动</button><span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setAnalysisEnabled((enabled) => !enabled); setMoreActionsOpen(false) }}>{analysisEnabled ? '关闭自动分析' : '开启自动分析'}</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setAnalysisIndicators(DEFAULT_ANALYSIS_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}<div className="analysis-summary"><span className="regime-badge">{analysis.environment}</span><span className={`direction-badge ${analysis.direction === '做多' ? 'long' : analysis.direction === '做空' ? 'short' : ''}`}>{analysis.direction}</span><span className="analysis-status">{analysis.status}</span><b>支撑 {formatPrice(analysis.support)} · 阻力 {formatPrice(analysis.resistance)}</b><b>止损 {formatPrice(analysis.stopLoss)} · 止盈 {formatPrice(analysis.takeProfit)}</b><b>参考盈亏比 {analysis.rr === null ? '—' : `1:${analysis.rr.toFixed(1)}`}</b></div>{multiTimeframeAnalysis && <div className="multitimeframe-strip"><strong>多周期 · {multiTimeframeAnalysis.direction} · {multiTimeframeAnalysis.agreement}% 一致</strong><span>{multiTimeframeAnalysis.status}</span>{intervals.map((timeframe) => { const item = multiTimeframeAnalysis.byTimeframe[timeframe]; return <span key={timeframe} className="multitimeframe-item"><b>{timeframe.toUpperCase()}</b> {item.direction} · {item.environment}</span> })}</div>}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small>{hiddenAnalysisLineIds.length > 0 && <button type="button" className="restore-analysis-lines" onClick={restoreAnalysisLines}>恢复自动标注</button>}<span className="toolbar-spacer" /><span className={`chart-status ${marketTransport === 'websocket' || marketTransport === 'rest' ? 'online' : ''}`}><i />{marketTransportLabel}{marketTransport === 'websocket' ? ` · ${chartPaneCount} 个指标窗` : ''}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}><LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期 · 震荡/突破时切至 15m 并保持' : '手动周期'} · 自动分析线 · Binance USDⓈ-M · {marketTransport === 'websocket' ? '实时' : marketTransport === 'rest' ? 'REST补偿' : '等待连接'}</span></div>{analysisOpen && <div className="analysis-modal-backdrop" onClick={() => setAnalysisOpen(false)}><div className="analysis-modal" role="dialog" aria-modal="true" aria-label="自动市场分析" onClick={(event) => event.stopPropagation()}><div className="analysis-modal-head"><div><span className="eyebrow">MARKET READ</span><h3>{active.replace(activeQuoteAsset, `/${activeQuoteAsset}`)} · {analysisViewInterval.toUpperCase()}</h3></div><button type="button" onClick={() => setAnalysisOpen(false)} aria-label="关闭">×</button></div><div className="analysis-modal-state"><span className={`direction-badge ${analysisView.direction === '做多' ? 'long' : analysisView.direction === '做空' ? 'short' : ''}`}>{analysisView.direction}</span><b>{analysisView.environment}</b></div><p>{analysisView.status}</p><div className="analysis-values"><div><small>参考入场</small><b>{formatPrice(analysisView.entry)}</b></div><div><small>支撑位</small><b>{formatPrice(analysisView.support)}</b></div><div><small>阻力位</small><b>{formatPrice(analysisView.resistance)}</b></div><div><small>止损</small><b>{formatPrice(analysisView.stopLoss)}</b></div><div><small>止盈</small><b>{formatPrice(analysisView.takeProfit)}</b></div><div><small>参考盈亏比</small><b>{analysisView.rr === null ? '—' : `1:${analysisView.rr.toFixed(1)}`}</b></div></div>{analysisDetailPanel}<button className="ai-analysis-action" onClick={callAiAnalysis} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? 'AI 正在分析…' : '✦ 调用 AI 助手分析'}</button><div className="analysis-modal-foot">依据已收盘 K 线自动计算；分析线只作参考，不会自动下单。{!health.aiConfigured && <span> AI 服务未配置。</span>}</div></div></div>}</section>
       <aside id="trade-panel" className="trade-panel panel">
         <div className="tabs"><button className={tab === 'order' ? 'active' : ''} onClick={() => setTab('order')}>下单</button><button className={tab === 'ai' ? 'active' : ''} onClick={() => setTab('ai')}>AI 助手 <span className="new-dot" /></button></div>
         {tab === 'order' ? <div className="order-content">
