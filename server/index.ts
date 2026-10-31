@@ -55,7 +55,9 @@ const configuredAiMaxTokens = Number(process.env.OPENAI_MAX_TOKENS ?? 900)
 const aiMaxTokens = Number.isFinite(configuredAiMaxTokens) && configuredAiMaxTokens >= 128
   ? Math.min(Math.round(configuredAiMaxTokens), 4_096)
   : 900
-const predictionEnabled = process.env.PREDICTION_ENABLED === 'true'
+// The local prediction service is the default direction source. Set this to
+// false explicitly when a deployment does not want model predictions.
+const predictionEnabled = process.env.PREDICTION_ENABLED !== 'false'
 const predictionServiceUrl = (process.env.PREDICTION_SERVICE_URL ?? 'http://127.0.0.1:8790/predict').replace(/\/$/, '')
 const configuredPredictionTimeoutMs = Number(process.env.PREDICTION_TIMEOUT_MS ?? 10_000)
 const predictionTimeoutMs = Number.isFinite(configuredPredictionTimeoutMs) && configuredPredictionTimeoutMs >= 2_000
@@ -202,7 +204,7 @@ type PredictionCandleInput = { time?: number; open?: number; high?: number; low?
 type PredictionRequestBody = { symbol?: string; interval?: string; candles?: PredictionCandleInput[]; horizonBars?: number }
 
 app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, reply) => {
-  if (!predictionEnabled) return reply.code(503).send({ error: '本地预测模型未启用，请启动预测服务并设置 PREDICTION_ENABLED=true。' })
+  if (!predictionEnabled) return reply.code(503).send({ error: '本地预测模型已被配置关闭，请设置 PREDICTION_ENABLED=true 后重启后端。' })
   const symbol = request.body?.symbol?.toUpperCase()
   const interval = request.body?.interval
   const candles = request.body?.candles
@@ -624,7 +626,31 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
   }
 })
 
-app.post<{ Body: { question: string; context: { symbol: string; interval: string; price: number | null; analysis?: { environment: string; direction: string; status: string; entry: number | null; support: number | null; resistance: number | null; stopLoss: number | null; takeProfit: number | null; riskReward: number | null }; lines: Array<{ label: string; price: number }>; trends?: Array<{ id: number; start: { time: number; price: number }; end: { time: number; price: number } }>; candles?: Array<{ time: number; open: number; high: number; low: number; close: number }> } } }>('/api/assistant', async (request, reply) => {
+type ExplanationPredictionContext = {
+  model?: string
+  version?: string
+  direction?: 'UP' | 'DOWN' | 'NEUTRAL' | string
+  probabilityUp?: number
+  probabilityDown?: number
+  probabilityNeutral?: number
+  confidence?: number
+  horizonBars?: number
+  dataThrough?: number
+  generatedAt?: number
+  validation?: { accuracy?: number; brier?: number; coverage?: number; testSamples?: number }
+}
+type ExplanationContext = {
+  symbol: string
+  interval: string
+  price: number | null
+  prediction?: ExplanationPredictionContext | null
+  candles?: Array<{ time: number; open: number; high: number; low: number; close: number; volume?: number }>
+  indicators?: Record<string, unknown>
+  manualLines?: Array<{ label: string; price: number }>
+  trends?: Array<{ id: number; start: { time: number; price: number }; end: { time: number; price: number } }>
+}
+
+app.post<{ Body: { question: string; context: ExplanationContext } }>('/api/assistant', async (request, reply) => {
   if (!aiModel || !aiBaseUrl) return reply.code(503).send({ error: '本地服务器尚未配置 OpenAI 兼容 AI 服务。' })
   const question = request.body?.question?.trim()
   if (!question) return reply.code(400).send({ error: '请输入问题' })
@@ -635,7 +661,7 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
     const requestBody = {
       model: aiModel,
       messages: [
-        { role: 'system', content: '你是 KEEL 个人交易工作台里的中文市场分析助手，服务于 Binance USDⓈ-M Futures 图表。用户主动调用你做复核和解释；本地程序已提供交易对、周期、价格、近期K线、支撑阻力、市场环境、参考入场/止盈/止损/盈亏比及用户画线。只使用本次上下文，不声称拿到了未提供的实时行情，不编造价格、指标或消息。先区分本地程序计算结果与自己的判断；若数据不足、K线不完整或上下文矛盾，明确说明。分析震荡区间时区分下沿、上沿和区间中部：边缘确认后才讨论反弹/回落计划，中部原则上观望；止损应在失效边界之外，止盈优先看区间另一侧，并核对参考盈亏比，空间不足时提示观望。输出简洁、可核对的中文小节：市场状态与依据、计划方向/入场条件、参考止损、参考止盈、参考盈亏比、失效条件与不确定性；没有可用方向时明确写观望。所有价位仅供参考，不保证收益，不替用户下单，也不把建议写成确定预测。只输出自然中文纯文本，使用简短小标题和段落；不要使用 Markdown 格式、星号、井号、反引号、项目符号或代码围栏。' },
+        { role: 'system', content: '你是 KEEL 的 AI 解释层，服务于 Binance USDⓈ-M Futures K 线预测。你不是独立预测器，也不是下单顾问；只能解释上下文中本地通用预测模型已经给出的方向、概率、置信度、预测周期、验证指标和近期已收盘 K 线。绝对不要自行改写概率、补造数据、声称保证正确率、生成确定性的买卖指令、入场价、止盈止损、杠杆或仓位。只使用本次上下文，不声称拿到了未提供的实时行情。若预测为空、数据不足、模型过期、验证指标缺失或概率接近，应明确写“暂无足够依据”，不要猜测。用简短中文纯文本回答，固定包含四段：模型结论、数据依据、风险与失效条件、解释边界。模型方向为 NEUTRAL 时解释为信号不足；低置信度时优先建议观望。所有内容仅用于理解模型，不构成投资建议，也不会自动下单。不要使用 Markdown、星号、井号、反引号、项目符号或代码围栏。' },
         { role: 'user', content: `当前上下文：${JSON.stringify(context)}\n\n问题：${question}` },
       ],
       temperature: 0.4,
