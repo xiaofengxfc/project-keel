@@ -47,17 +47,20 @@ def main() -> None:
     backup = args.model_root / f"{args.interval}.previous"
     if backup.exists() and not target.exists():
         backup.rename(target)
+    input_paths: list[str] = []
     for symbol in symbols:
+        output_path = args.data_dir / f"{symbol}-{args.interval}.csv"
         run_module("prediction.collect_klines", [
             "--symbol", symbol, "--interval", args.interval,
             "--start-time", str(args.start_time),
-            "--output", str(args.data_dir / f"{symbol}-{args.interval}.csv"),
+            "--output", str(output_path),
         ])
+        input_paths.append(str(output_path))
 
     with tempfile.TemporaryDirectory(prefix="keel-model-") as temporary:
         candidate = Path(temporary) / args.interval
         run_module("prediction.train", [
-            "--input", str(args.data_dir), "--interval", args.interval,
+            "--input", *input_paths, "--interval", args.interval,
             "--horizon-bars", os.getenv("PREDICTION_HORIZON_BARS", "3"),
             "--output-dir", str(candidate),
         ])

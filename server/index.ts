@@ -220,6 +220,7 @@ type PredictionTrainingJob = {
 }
 let predictionTrainingJob: PredictionTrainingJob = { running: false, phase: 'idle', output: '', error: null, startedAt: null, finishedAt: null }
 let predictionTrainingProcess: ChildProcess | null = null
+let predictionTrainingStartInFlight = false
 
 app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, reply) => {
   if (!predictionEnabled) return reply.code(503).send({ error: '本地预测模型已被配置关闭，请设置 PREDICTION_ENABLED=true 后重启后端。' })
@@ -273,20 +274,49 @@ app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, rep
 
 app.get('/api/prediction/train/status', async () => predictionTrainingJob)
 
-app.post<{ Body: { interval?: string; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
-  if (predictionTrainingJob.running) return reply.code(409).send({ error: '模型训练正在运行，请等待完成。' })
+app.post<{ Body: { interval?: string; symbolCount?: number; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
+  if (predictionTrainingJob.running || predictionTrainingStartInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。' })
   const interval = request.body?.interval
   if (!interval || !['15m', '1h', '4h', '1d'].includes(interval)) return reply.code(400).send({ error: '请选择有效周期：15m、1h、4h 或 1d。' })
-  if (!Array.isArray(request.body?.symbols)) return reply.code(400).send({ error: '请提供至少两个交易对。' })
-  const symbols = [...new Set(request.body.symbols.map((symbol) => String(symbol).trim().toUpperCase()))]
-  if (symbols.length < 2 || symbols.length > 30 || symbols.some((symbol) => !/^[A-Z0-9]{3,20}$/.test(symbol))) {
-    return reply.code(400).send({ error: '通用模型需选择 2 到 30 个有效交易对。' })
+  const symbolCount = Number(request.body?.symbolCount)
+  if (!Number.isInteger(symbolCount) || symbolCount < 2 || symbolCount > 30) return reply.code(400).send({ error: '币种数量必须是 2 到 30 之间的整数。' })
+  if (request.body?.symbols !== undefined && !Array.isArray(request.body.symbols)) return reply.code(400).send({ error: '手动币种列表格式无效。' })
+  const requestedSymbols = [...new Set((request.body?.symbols ?? []).map((symbol) => String(symbol).trim().toUpperCase()).filter(Boolean))]
+  if (requestedSymbols.some((symbol) => !/^[A-Z0-9]{3,20}$/.test(symbol))) return reply.code(400).send({ error: '手动填写的交易对格式无效。' })
+  if (requestedSymbols.length > symbolCount) return reply.code(400).send({ error: `手动填写的交易对不能超过 ${symbolCount} 个。` })
+  predictionTrainingStartInFlight = true
+  let symbols: string[] = []
+  try {
+    let catalog: Array<{ symbol: string; baseAsset: string }>
+    if (cachedSymbols && cachedSymbols.expiresAt > Date.now()) {
+      catalog = cachedSymbols.symbols
+    } else {
+      const info = await binanceRequest<{ symbols: BinanceExchangeSymbol[] }>('GET', '/fapi/v1/exchangeInfo')
+      const next = tradableUsdtPerpetuals(info.symbols)
+      cachedSymbols = { expiresAt: Date.now() + 10 * 60 * 1000, symbols: next }
+      catalog = next
+    }
+    symbols = catalog.map(({ symbol }) => symbol.toUpperCase())
+    const available = new Set(symbols)
+    const unavailable = requestedSymbols.filter((symbol) => !available.has(symbol))
+    if (unavailable.length) return reply.code(400).send({ error: `交易对当前不可用：${unavailable.join(', ')}` })
+    const pool = symbols.filter((symbol) => !requestedSymbols.includes(symbol))
+    for (let index = pool.length - 1; index > 0; index -= 1) {
+      const swapIndex = crypto.randomInt(index + 1)
+      ;[pool[index], pool[swapIndex]] = [pool[swapIndex], pool[index]]
+    }
+    symbols = [...requestedSymbols, ...pool.slice(0, symbolCount - requestedSymbols.length)]
+    if (symbols.length < symbolCount) return reply.code(502).send({ error: `Binance 当前仅返回 ${symbols.length} 个可训练交易对。` })
+  } catch (error) {
+    return reply.code(502).send({ error: error instanceof Error ? `获取 Binance 训练币种失败：${error.message}` : '获取 Binance 训练币种失败' })
+  } finally {
+    predictionTrainingStartInFlight = false
   }
   const pythonPath = process.env.PREDICTION_PYTHON
     ?? (existsSync(resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'))
       ? resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
       : 'python')
-  predictionTrainingJob = { running: true, phase: 'running', output: '', error: null, startedAt: Date.now(), finishedAt: null, interval, symbols }
+  predictionTrainingJob = { running: true, phase: 'running', output: `训练币种：${symbols.join(', ')}\n正在采集历史 K 线…`, error: null, startedAt: Date.now(), finishedAt: null, interval, symbols }
   try {
     const child = spawn(pythonPath, ['-m', 'prediction.auto_train', '--symbols', symbols.join(','), '--interval', interval], {
       cwd: process.cwd(),
