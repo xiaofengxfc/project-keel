@@ -17,6 +17,21 @@ const aiKey = process.env.OPENAI_API_KEY ?? ''
 const aiModel = process.env.OPENAI_MODEL ?? ''
 const aiBaseUrl = (process.env.OPENAI_API_BASE ?? process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, '')
 const aiChatUrl = aiBaseUrl.endsWith('/chat/completions') ? aiBaseUrl : `${aiBaseUrl}/chat/completions`
+let serverTimeOffsetMs = 0
+let serverTimeSyncAt = 0
+
+async function syncBinanceServerTime(force = false) {
+  if (!force && Date.now() - serverTimeSyncAt < 60_000) return serverTimeOffsetMs
+  try {
+    const startedAt = Date.now()
+    const response = await fetch(`${baseUrl}/fapi/v1/time`, { signal: AbortSignal.timeout(4000) })
+    if (!response.ok) return serverTimeOffsetMs
+    const body = await response.json() as { serverTime?: number }
+    if (Number.isFinite(body.serverTime)) serverTimeOffsetMs = Number(body.serverTime) - Math.round((startedAt + Date.now()) / 2)
+    serverTimeSyncAt = Date.now()
+  } catch { /* 使用本机时间继续请求。 */ }
+  return serverTimeOffsetMs
+}
 
 await app.register(cors, {
   origin: process.env.APP_ORIGIN ?? 'http://localhost:5173',
@@ -32,7 +47,7 @@ function queryString(params: Record<string, QueryValue>) {
 }
 
 async function binanceRequest<T>(method: string, path: string, params: Record<string, QueryValue> = {}, signed = false): Promise<T> {
-  const values = signed ? { ...params, timestamp: Date.now(), recvWindow: 5000 } : params
+  const values = signed ? { ...params, timestamp: Date.now() + await syncBinanceServerTime(), recvWindow: 10000 } : params
   let query = queryString(values)
   const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' }
   if (signed) {
