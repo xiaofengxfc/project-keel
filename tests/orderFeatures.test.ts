@@ -106,6 +106,20 @@ test('protection replacement restores the original pair if a replacement fails',
   assert.deepEqual(calls, ['cancel:1', 'cancel:2', 'place:STOP_MARKET:95', 'place:TAKE_PROFIT_MARKET:125', 'remove:95', 'restore:STOP_MARKET:90', 'restore:TAKE_PROFIT_MARKET:120'])
 })
 
+test('protection replacement waits for cancellation confirmation before creating', async () => {
+  const calls: string[] = []
+  await replaceProtectionOrderSet({
+    previous: [{ order: { id: 1 }, value: { kind: 'STOP_MARKET', triggerPrice: '90', workingType: 'CONTRACT_PRICE' } }],
+    replacements: [{ kind: 'STOP_MARKET', triggerPrice: '95', workingType: 'CONTRACT_PRICE' }],
+    cancel: async () => { calls.push('cancel') },
+    afterCancel: async () => { calls.push('confirmed') },
+    place: async () => { calls.push('place'); return { id: 2 } },
+    remove: async () => {},
+    restore: async () => {},
+  })
+  assert.deepEqual(calls, ['cancel', 'confirmed', 'place'])
+})
+
 test('Binance precision alignment uses decimal strings without floating point drift', () => {
   assert.equal(isStepAligned('0.003', '0.001'), true)
   assert.equal(isStepAligned('0.0031', '0.001'), false)
