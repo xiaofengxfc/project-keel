@@ -1,8 +1,10 @@
 import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { isIP } from 'node:net'
 import 'dotenv/config'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
+import { ProxyAgent, setGlobalDispatcher } from 'undici'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
 import { isMarketExecution, isStepAligned, requiresAlgoEndpoint, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
 import { maximumLeverageForBrackets, protectionOrderDirection } from '../src/binanceTrading.js'
@@ -18,6 +20,29 @@ const aiKey = process.env.OPENAI_API_KEY ?? ''
 const aiModel = process.env.OPENAI_MODEL ?? ''
 const aiBaseUrl = (process.env.OPENAI_API_BASE ?? process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, '')
 const aiChatUrl = aiBaseUrl.endsWith('/chat/completions') ? aiBaseUrl : `${aiBaseUrl}/chat/completions`
+
+function configuredHttpsProxy() {
+  const explicitProxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.ALL_PROXY ?? process.env.all_proxy
+  if (explicitProxy?.trim()) return explicitProxy.trim()
+  if (process.platform !== 'win32') return ''
+  try {
+    const settingsKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
+    const enabled = execFileSync('reg', ['query', settingsKey, '/v', 'ProxyEnable'], { encoding: 'utf8', windowsHide: true })
+    if (!/ProxyEnable\s+REG_DWORD\s+0x1/i.test(enabled)) return ''
+    const rawProxy = execFileSync('reg', ['query', settingsKey, '/v', 'ProxyServer'], { encoding: 'utf8', windowsHide: true })
+      .match(/ProxyServer\s+REG_SZ\s+(.+)/i)?.[1]?.trim()
+    if (!rawProxy) return ''
+    const configured = rawProxy.split(';').map((entry) => entry.trim()).find((entry) => /^https=/i.test(entry))?.replace(/^https=/i, '') ?? rawProxy.split(';')[0].trim()
+    if (!configured) return ''
+    return /^[a-z][a-z\d+.-]*:\/\//i.test(configured) ? configured : `http://${configured}`
+  } catch {
+    return ''
+  }
+}
+
+const httpsProxy = configuredHttpsProxy()
+if (httpsProxy) setGlobalDispatcher(new ProxyAgent(httpsProxy))
+
 // Reasoning models and compatible gateways can occasionally take longer than the
 // 30 second default used by AbortSignal.timeout. Keep the request alive long
 // enough for a normal completion, while allowing deployments to tune the limit.
@@ -65,7 +90,11 @@ async function binanceRequest<T>(method: string, path: string, params: Record<st
   }
   const response = await fetch(`${baseUrl}${path}${query ? `?${query}` : ''}`, { method, headers, signal: AbortSignal.timeout(10000) })
   const body = await response.json() as T & { code?: number; msg?: string }
-  if (!response.ok) throw new Error(`Binance ${body?.code ?? response.status}: ${body?.msg ?? response.statusText}`)
+  if (!response.ok) {
+    const code = body?.code ?? response.status
+    if (code === -2015) throw new Error('Binance API Key 无效、未通过当前出口 IP 白名单，或未开启 USDⓈ-M 合约权限。请检查正式网 API 配置。')
+    throw new Error(`Binance ${code}: ${body?.msg ?? response.statusText}`)
+  }
   return body
 }
 
