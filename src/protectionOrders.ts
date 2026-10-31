@@ -26,37 +26,15 @@ export async function replaceProtectionOrderSet<TOrder, TPlaced>(options: {
   restore: (value: ProtectionOrderValue) => Promise<unknown>
 }) {
   const cancelled: ProtectionOrderSnapshot<TOrder>[] = []
-  if (options.afterCancel) {
-    const cancelErrors: unknown[] = []
+  try {
     for (const snapshot of options.previous) {
-      try {
-        await options.cancel(snapshot.order)
-        cancelled.push(snapshot)
-      } catch (error) {
-        cancelErrors.push(error)
-      }
+      await options.cancel(snapshot.order)
+      cancelled.push(snapshot)
     }
-    try {
-      await options.afterCancel()
-    } catch (error) {
-      const detail = cancelErrors.length ? `；撤单响应：${errorMessage(cancelErrors[0])}` : ''
-      await Promise.allSettled(cancelled.map(({ value }) => options.restore(value)))
-      throw new Error(`旧保护单撤销状态未确认，未创建新单：${errorMessage(error)}${detail}`)
-    }
-    if (cancelErrors.length) {
-      await Promise.allSettled(cancelled.map(({ value }) => options.restore(value)))
-      throw new Error(`撤销旧保护单失败，已尝试恢复已撤销订单：${errorMessage(cancelErrors[0])}`)
-    }
-  } else {
-    try {
-      for (const snapshot of options.previous) {
-        await options.cancel(snapshot.order)
-        cancelled.push(snapshot)
-      }
-    } catch (error) {
-      await Promise.allSettled(cancelled.map(({ value }) => options.restore(value)))
-      throw new Error(`撤销旧保护单失败，已尝试恢复已撤销订单：${errorMessage(error)}`)
-    }
+    if (options.afterCancel) await options.afterCancel()
+  } catch (error) {
+    await Promise.allSettled(cancelled.map(({ value }) => options.restore(value)))
+    throw new Error(`旧保护单撤销状态未确认，未创建新单：${errorMessage(error)}`)
   }
 
   const placed: TPlaced[] = []
