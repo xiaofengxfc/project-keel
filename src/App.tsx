@@ -17,6 +17,7 @@ type TrainingStatus = { running: boolean; phase?: string; output?: string; error
 type MarketQuote = { price: number; change: number }
 type Interval = '15m' | '1h' | '4h' | '1d'
 type MarketTransport = 'connecting' | 'websocket' | 'rest' | 'offline'
+type WorkspaceView = 'markets' | 'training'
 type PositionRow = { symbol: string; positionAmt: number; entryPrice: number; markPrice: number; liquidationPrice: number; unrealizedProfit: number; leverage: number; marginType: string; positionSide: string }
 type OrderRow = { orderId: number; symbol: string; side: string; type: string; positionSide?: string; closePosition?: boolean | string; isAlgoOrder?: boolean; price: number; stopPrice: number; origQty: number; executedQty: number; status: string; time: number; updateTime: number }
 type TradeRow = { id: number; symbol: string; orderId: number; side: 'BUY' | 'SELL'; positionSide: string; price: number; qty: number; time: number }
@@ -104,15 +105,18 @@ type MarketListProps = {
   loading: boolean
   error: string
   mobileOpen: boolean
+  view: WorkspaceView
   onCloseMobile: () => void
   onSearchChange: (value: string) => void
   onSelect: (symbol: string) => void
   onToggleFavorite: (symbol: string) => void
   onMoveFavorite: (symbol: string, offset: -1 | 1) => void
   onReorder: (from: string, over: string) => void
+  onOpenTraining: () => void
+  onOpenMarkets: () => void
 }
 
-function MarketList({ symbols, availableSymbols, favoriteSymbols, active, quotes, search, loading, error, mobileOpen, onCloseMobile, onSearchChange, onSelect, onToggleFavorite, onMoveFavorite, onReorder }: MarketListProps) {
+function MarketList({ symbols, availableSymbols, favoriteSymbols, active, quotes, search, loading, error, mobileOpen, view, onCloseMobile, onSearchChange, onSelect, onToggleFavorite, onMoveFavorite, onReorder, onOpenTraining, onOpenMarkets }: MarketListProps) {
   const dragRef = useRef<{ from: string; over: string } | null>(null)
   const [dragging, setDragging] = useState<string | null>(null)
   const showFavorites = search.trim().length === 0
@@ -161,6 +165,10 @@ function MarketList({ symbols, availableSymbols, favoriteSymbols, active, quotes
     {mobileOpen && <button type="button" className="mobile-market-backdrop" aria-label="关闭自选列表" onClick={onCloseMobile} />}
     <aside className={`watchlist panel ${mobileOpen ? 'mobile-markets-open' : ''}`}>
       <div className="panel-head"><div><span className="eyebrow">MARKETS</span><h2>自选行情</h2></div><button type="button" className="market-close" aria-label="关闭行情列表" onClick={onCloseMobile}>×</button></div>
+      <div className="workspace-nav" aria-label="工作区导航">
+        <button type="button" className={view === 'markets' ? 'active' : ''} onClick={onOpenMarkets}>⌁ <span>行情与交易</span></button>
+        <button type="button" className={view === 'training' ? 'active' : ''} onClick={onOpenTraining}>◈ <span>模型训练</span></button>
+      </div>
       <div className="search">⌕ <input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索 Binance USDT 永续" aria-label="搜索 Binance USDT 永续交易对" autoFocus={mobileOpen} /></div>
       {showFavorites && favoriteSymbols.length > 1 && <small className="watch-sort-hint">按住 ⠿ 拖动排序，也可用箭头调整</small>}
       <div className="watch-items">{filteredRows}</div>
@@ -170,6 +178,7 @@ function MarketList({ symbols, availableSymbols, favoriteSymbols, active, quotes
 }
 
 function App() {
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>('markets')
   const [watchlist, setWatchlist] = useState<string[]>(() => parseWatchlist(localStorage.getItem(WATCHLIST_STORAGE_KEY)))
   const watchlistRef = useRef(watchlist)
   const [active, setActive] = useState(() => parseWatchlist(localStorage.getItem(WATCHLIST_STORAGE_KEY))[0] ?? '')
@@ -1121,6 +1130,33 @@ function App() {
     <div className="indicator-columns"><div><strong>图表显示</strong>{chartIndicatorOptions.map(({ key, label }) => <label className="indicator-check" key={`chart-${key}`}><input type="checkbox" checked={chartIndicators[key]} onChange={(event) => setChartIndicators((current) => ({ ...current, [key]: event.target.checked }))} /><span>{label}</span></label>)}</div></div>
     <small className="indicator-note">指标仅用于查看 K 线，不自动生成交易方向或价位。</small>
   </div> : null
+  const trainingPage = <section className="training-page panel">
+    <div className="training-page-header">
+      <div><span className="eyebrow">LOCAL MODEL WORKSHOP</span><h1>通用 K 线模型训练</h1><p>使用多个币种的历史 K 线训练同一个方向模型，模型保存在本地。只有通过验证门槛的模型才会替换当前版本。</p></div>
+      <span className={`training-status-badge ${trainingStatus.running ? 'running' : trainingStatus.phase === 'completed' ? 'completed' : trainingStatus.phase === 'failed' ? 'failed' : ''}`}><i />{trainingStatus.running ? '训练中' : trainingStatus.phase === 'completed' ? '已完成' : trainingStatus.phase === 'failed' ? '未完成' : '等待训练'}</span>
+    </div>
+    <div className="training-page-grid">
+      <section className="training-config-card">
+        <div className="training-section-heading"><span>01</span><div><h2>训练配置</h2><p>选择模型周期和训练币种</p></div></div>
+        <div className="training-page-fields">
+          <label>预测周期<select value={trainingInterval} onChange={(event) => setTrainingInterval(event.target.value as Interval)} disabled={trainingStatus.running}><option value="15m">15 分钟</option><option value="1h">1 小时</option><option value="4h">4 小时</option><option value="1d">1 天</option></select></label>
+          <label>训练币种（逗号分隔）<input value={trainingSymbols} onChange={(event) => setTrainingSymbols(event.target.value)} disabled={trainingStatus.running} placeholder="BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT" /></label>
+          <small>至少 2 个、最多 30 个币种。示例：BTCUSDT, ETHUSDT, BNBUSDT</small>
+        </div>
+        <button type="button" className="training-start-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running}>{trainingStatus.running ? '模型正在训练…' : '开始训练模型'}</button>
+        {(trainingRequestError || trainingStatus.error) && <div className="training-page-error" role="alert">{trainingRequestError || trainingStatus.error}</div>}
+      </section>
+      <section className="training-run-card">
+        <div className="training-section-heading"><span>02</span><div><h2>训练进度与结果</h2><p>训练完成后会自动验证并尝试热加载</p></div></div>
+        {trainingStatus.running ? <div className="training-progress" role="status"><i /><div><strong>正在训练 {trainingStatus.interval ?? trainingInterval} 通用模型</strong><span>{trainingStatus.symbols?.join(' · ') ?? '正在提交训练任务'}</span></div></div>
+          : trainingStatus.phase === 'completed' ? <div className="training-page-result" role="status"><strong>训练完成，模型已保存</strong><div><span>验证准确率 <b>{trainingStatus.metrics?.accuracy === undefined ? '—' : `${(trainingStatus.metrics.accuracy * 100).toFixed(1)}%`}</b></span><span>Brier <b>{trainingStatus.metrics?.brier === undefined ? '—' : trainingStatus.metrics.brier.toFixed(4)}</b></span><span>测试样本 <b>{trainingStatus.metrics?.testSamples?.toLocaleString() ?? '—'}</b></span></div></div>
+            : trainingStatus.phase === 'failed' ? <div className="training-idle failed" role="status">训练未完成，请查看错误信息或日志后重试。</div>
+              : <div className="training-idle">尚未启动训练。模型文件会保存在 <code>prediction/models/&lt;周期&gt;</code>。</div>}
+        {trainingStatus.output && <details className="training-page-log"><summary>查看训练日志</summary><pre>{trainingStatus.output}</pre></details>}
+      </section>
+    </div>
+    <div className="training-page-note"><strong>验证说明</strong><span>候选模型至少需要 500 个独立测试样本，准确率达到 80%，且评估指标不劣于当前模型，才会更新线上模型。</span></div>
+  </section>
   const predictionPanel = <div className="prediction-card prediction-card-main">
     <div className="prediction-card-head"><strong>通用 K 线预测</strong><small>{prediction?.model ?? 'LightGBM / ONNX'}</small></div>
     {!health.predictionConfigured ? <small className="prediction-muted">本地预测服务未连接。</small>
@@ -1131,20 +1167,6 @@ function App() {
             <div className="prediction-probabilities"><span>上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span>下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span>中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>
             <small className="prediction-meta">模型 {prediction.version} · 测试准确率 {prediction.validation?.accuracy === undefined ? '—' : `${Math.round(prediction.validation.accuracy * 100)}%`} · 数据截至 {new Date(prediction.dataThrough * 1000).toLocaleString()}</small>
           </> : <small className="prediction-muted">等待足够的已收盘 K 线。</small>}
-    <div className="prediction-training">
-      <div className="prediction-training-heading"><strong>训练通用模型</strong><small>训练产物保存在本地</small></div>
-      <small className="prediction-training-note">使用多个币种的历史 K 线训练同一个方向模型；仅当验证结果达标时才更新模型。</small>
-      <div className="prediction-training-fields">
-        <label>周期<select value={trainingInterval} onChange={(event) => setTrainingInterval(event.target.value as Interval)} disabled={trainingStatus.running}><option value="15m">15 分钟</option><option value="1h">1 小时</option><option value="4h">4 小时</option><option value="1d">1 天</option></select></label>
-        <label>交易对（逗号分隔）<input value={trainingSymbols} onChange={(event) => setTrainingSymbols(event.target.value)} disabled={trainingStatus.running} placeholder="BTCUSDT,ETHUSDT,BNBUSDT" /></label>
-      </div>
-      <button type="button" className="prediction-training-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running}>{trainingStatus.running ? '模型训练中…' : '开始训练'}</button>
-      {(trainingRequestError || trainingStatus.error) && <small className="prediction-training-error" role="alert">{trainingRequestError || trainingStatus.error}</small>}
-      {trainingStatus.running && <div className="prediction-training-state" role="status"><i />正在训练 {trainingStatus.interval ?? trainingInterval} 通用模型 · {trainingStatus.symbols?.join(', ') ?? '正在提交任务'}</div>}
-      {trainingStatus.phase === 'completed' && <div className="prediction-training-result" role="status"><strong>训练完成，模型已保存</strong><span>验证准确率 {trainingStatus.metrics?.accuracy === undefined ? '—' : `${(trainingStatus.metrics.accuracy * 100).toFixed(1)}%`} · Brier {trainingStatus.metrics?.brier === undefined ? '—' : trainingStatus.metrics.brier.toFixed(4)} · 测试样本 {trainingStatus.metrics?.testSamples?.toLocaleString() ?? '—'}</span></div>}
-      {trainingStatus.phase === 'failed' && <div className="prediction-training-failed" role="status">训练未完成</div>}
-      {trainingStatus.output && <details className="prediction-training-log"><summary>训练日志</summary><pre>{trainingStatus.output}</pre></details>}
-    </div>
   </div>
   const formatOrderTime = (value: number) => Number.isFinite(value) && value > 0 ? new Date(value).toLocaleString() : '—'
   const formatOrderPrice = (order: OrderRow) => order.price > 0 && order.stopPrice > 0 ? `${formatPrice(order.price)} / 触发 ${formatPrice(order.stopPrice)}` : order.price > 0 ? formatPrice(order.price) : order.stopPrice > 0 ? `触发 ${formatPrice(order.stopPrice)}` : '市价'
@@ -1161,7 +1183,7 @@ function App() {
       <div className="brand"><div className="brand-mark">K</div><div><strong>KEEL</strong><span>TRADING DESK</span></div></div>
       <div className="top-actions"><div className={`connection ${marketAvailable ? 'online' : ''}`}><i />{marketTransport === 'websocket' ? `Binance ${health.environment === 'testnet' ? '测试网' : '正式网'} 已连接` : marketTransport === 'rest' ? 'Binance REST 行情补偿中' : active ? '正在连接 Binance' : '请先收藏币种'}</div><button type="button" className="icon-btn ip-check" title="检测后端访问 Binance 使用的公网出口 IP" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `出口 IP ${publicIp}` : '检测出口 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
     </header>
-    <main className="workspace">
+    <main className={`workspace ${workspaceView === 'training' ? 'training-view' : ''}`}>
       <MarketList
         symbols={filteredSymbols}
         availableSymbols={availableSymbols}
@@ -1172,13 +1194,17 @@ function App() {
         loading={symbolCatalogLoading}
         error={symbolCatalogError}
         mobileOpen={mobileMarketsOpen}
+        view={workspaceView}
         onCloseMobile={() => setMobileMarketsOpen(false)}
         onSearchChange={setSymbolSearch}
         onSelect={(symbol) => { if (symbol !== active) { if (autoTimeframe) { setInterval('1h') } setOrderPrice(null); setStopPrice(''); setActivationPrice(''); setClosePosition(false); setOrderPercent(0); setQty('0'); setLeverageBrackets([]); setLeverageBracketsSymbol(''); setCandles([]); setChartIndicators((current) => ({ ...current })); setActive(symbol) } setMobileMarketsOpen(false) }}
         onToggleFavorite={toggleFavorite}
         onMoveFavorite={moveFavorite}
         onReorder={(from, over) => setWatchlist((current) => reorderWatchlist(current, from, over))}
+        onOpenTraining={() => { setWorkspaceView('training'); setMobileMarketsOpen(false) }}
+        onOpenMarkets={() => { setWorkspaceView('markets'); setMobileMarketsOpen(false) }}
       />
+      {workspaceView === 'training' ? trainingPage : <>
       <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><span className="prediction-header-label">通用预测 · {prediction ? (prediction.direction === 'UP' ? '上涨' : prediction.direction === 'DOWN' ? '下跌' : '信号不足') : predictionError ? '方向信号暂不可用' : '等待模型'}</span><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}{predictionPanel}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small><span className="toolbar-spacer" /><span className={`chart-status ${marketTransport === 'websocket' || marketTransport === 'rest' ? 'online' : ''}`}><i />{marketTransportLabel}{marketTransport === 'websocket' ? ` · ${chartPaneCount} 个指标窗` : ''}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}><LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期' : '手动周期'} · 通用预测 · Binance USDⓈ-M · {marketTransport === 'websocket' ? '实时' : marketTransport === 'rest' ? 'REST补偿' : '等待连接'}</span></div></section>
       <aside id="trade-panel" className="trade-panel panel">
         <div className="tabs"><button className={tab === 'order' ? 'active' : ''} onClick={() => setTab('order')}>下单</button><button className={tab === 'ai' ? 'active' : ''} onClick={() => setTab('ai')}>AI 解释层 <span className="new-dot" /></button></div>
@@ -1219,8 +1245,9 @@ function App() {
           <div className="api-note"><span>⌁</span><div><b>{health.tradingEnabled ? (health.environment === 'testnet' ? '测试网下单已启用' : '实盘交易已启用') : health.environment === 'testnet' ? '测试网下单未启用' : '实盘交易未启用'}</b><small>{health.privateApiConfigured ? (health.tradingEnabled ? '仅点击上方下单按钮时提交订单' : 'API 已配置，安全开关关闭，订单提交不可用') : '请在后端配置所选环境的 Binance API Key'}</small></div></div>
         </div> : <div className="ai-content"><div className="ai-intro"><div className="ai-spark">✦</div><h3>预测解释层</h3><p>解释通用 K 线预测模型的方向、概率、依据与风险。</p><small className={health.aiConfigured ? 'ai-ready' : 'ai-unavailable'}>{health.aiConfigured ? 'AI 已连接 · 可按需调用分析' : 'AI 尚未配置，请检查本地服务设置'}</small></div><div className="messages">{messages.map((message, index) => <div className={message.startsWith('你：') ? 'message user' : 'message'} key={`${message}-${index}`}>{message}</div>)}</div><div className="quick-prompts"><button onClick={() => setQuestion('为什么模型偏向这个方向？')}>为什么是这个方向？</button><button onClick={() => setQuestion('解释当前预测的风险和失效条件')}>风险和失效条件</button></div><div className="ai-input"><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void ask() } }} placeholder="询问模型预测的依据、风险或失效条件..." /><button onClick={() => void ask()} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? '…' : '↑'}</button></div><small className="ai-disclaimer">AI 仅解释模型结果，不构成投资建议，也不会自动下单。</small></div>}
       </aside>
+      </>}
     </main>
-    <section className="bottom-panel panel">
+    {workspaceView === 'markets' && <section className="bottom-panel panel">
       <div className="bottom-tabs">
         <button className={bottomTab === 'positions' ? 'active' : ''} onClick={() => setBottomTab('positions')}>持仓 <span>{positions.length}</span></button>
         <button className={bottomTab === 'openOrders' ? 'active' : ''} onClick={() => setBottomTab('openOrders')}>当前委托 <span>{openOrders.length}</span></button>
@@ -1234,9 +1261,9 @@ function App() {
       {ordersError && <div className="account-error" role="alert">{ordersError}</div>}
       {ipError && <div className="account-error" role="alert">{ipError}</div>}
       {!health.privateApiConfigured ? <div className="empty-state"><div className="empty-icon">⌁</div><div><b>未连接私有 API</b><span>配置 Binance 只读 API Key 后可读取真实账户持仓与订单</span></div></div> : ordersLoading && !positions.length && !openOrders.length && !orderHistory.length && !trades.length ? <div className="empty-state"><div className="empty-icon">⌁</div><div><b>正在同步账户数据</b><span>读取 Binance USDⓈ-M Futures 私有接口</span></div></div> : bottomTab === 'positions' ? positions.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>持仓数量</th><th>开仓均价</th><th>标记价格</th><th>未实现盈亏</th><th>杠杆</th><th>操作</th></tr></thead><tbody>{positions.map((position, index) => <tr key={`${position.symbol}-${position.positionSide}-${index}`}><td><b>{position.symbol}</b><small>{position.positionSide === 'BOTH' ? position.positionAmt > 0 ? '单向多仓' : '单向空仓' : position.positionSide === 'LONG' ? '多仓' : '空仓'}</small></td><td className={position.positionAmt >= 0 ? 'up' : 'down'}>{formatPrice(position.positionAmt)}</td><td>{formatPrice(position.entryPrice)}</td><td>{formatPrice(position.markPrice)}</td><td className={position.unrealizedProfit >= 0 ? 'up' : 'down'}>{formatPrice(position.unrealizedProfit)} USDT</td><td>{position.leverage}x</td><td><button type="button" className="manage-position" onClick={() => openPositionEditor(position)}>管理</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无持仓</b><span>当前账户没有未平仓的合约持仓</span></div></div> : bottomTab === 'openOrders' ? openOrders.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>订单类型</th><th>价格 / 触发价</th><th>数量 / 已成交</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{openOrders.map((order) => <tr key={`${order.symbol}-${order.orderId}`}><td><b>{order.symbol}</b><small className={order.side === 'BUY' ? 'up' : 'down'}>{order.side === 'BUY' ? '买入' : '卖出'}</small></td><td>{orderTypeLabel(order.type)}</td><td>{formatOrderPrice(order)}</td><td>{formatPrice(order.origQty)} / {formatPrice(order.executedQty)}</td><td>{formatOrderTime(order.updateTime || order.time)}</td><td><button type="button" className="cancel-order" onClick={() => void cancelOrder(order)} disabled={cancellingOrderId === order.orderId}>{cancellingOrderId === order.orderId ? '撤销中…' : '撤单'}</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无当前委托</b><span>交易对 {active} 的未完成订单会显示在这里</span></div></div> : bottomTab === 'history' ? orderHistory.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>订单类型</th><th>价格 / 触发价</th><th>数量 / 已成交</th><th>状态</th><th>更新时间</th></tr></thead><tbody>{orderHistory.map((order) => <tr key={`${order.symbol}-${order.orderId}`}><td><b>{order.symbol}</b><small className={order.side === 'BUY' ? 'up' : 'down'}>{order.side === 'BUY' ? '买入' : '卖出'}</small></td><td>{orderTypeLabel(order.type)}</td><td>{formatOrderPrice(order)}</td><td>{formatPrice(order.origQty)} / {formatPrice(order.executedQty)}</td><td>{orderStatusLabel(order.status)}</td><td>{formatOrderTime(order.updateTime || order.time)}</td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无历史订单</b><span>历史记录按当前交易对 {active} 查询</span></div></div> : trades.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>方向</th><th>成交价</th><th>数量</th><th>时间</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><b>{trade.symbol}</b><small>{trade.positionSide === 'LONG' ? '多仓' : trade.positionSide === 'SHORT' ? '空仓' : '单向'}</small></td><td className={trade.side === 'BUY' ? 'up' : 'down'}>{trade.side === 'BUY' ? '买入' : '卖出'}</td><td>{formatPrice(trade.price)}</td><td>{formatPrice(trade.qty)}</td><td>{formatOrderTime(trade.time)}</td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无成交记录</b><span>成交记录按当前交易对 {active} 查询，Binance 仅支持近 3 个月</span></div></div>}
-    </section>
+    </section>}
     {managePosition && <div className="position-modal-backdrop" onClick={() => setManagePosition(null)}><div className="position-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}><div className="position-modal-head"><div><span className="eyebrow">POSITION MANAGEMENT</span><h3>{managePosition.symbol} · {managePosition.positionSide === 'SHORT' ? '空仓' : '多仓'}</h3></div><button type="button" onClick={() => setManagePosition(null)} aria-label="关闭">×</button></div><div className="position-snapshot"><span>数量 <b>{formatPrice(Math.abs(managePosition.positionAmt))}</b></span><span>开仓均价 <b>{formatPrice(managePosition.entryPrice)}</b></span><span>强平价格 <b>{formatPrice(managePosition.liquidationPrice)}</b></span></div><div className="position-modal-grid"><label>止损价格<input type="number" min="0" step="any" value={manageStopLoss} onChange={(event) => { setManageStopLoss(event.target.value); setManageStopLossChanged(true) }} /><small>留空则清除保护单</small></label><label>止盈价格<input type="number" min="0" step="any" value={manageTakeProfit} onChange={(event) => { setManageTakeProfit(event.target.value); setManageTakeProfitChanged(true) }} /><small>留空则清除保护单</small></label></div><button type="button" className="manage-primary" onClick={() => void submitManage()} disabled={manageBusy}>{manageBusy ? '提交中…' : '保存止盈止损'}</button><div className="partial-close"><div className="partial-close-head"><span>部分平仓比例</span><b>{manageClosePercent}%</b></div><div className="partial-close-quantity">预计平仓数量 <b>{partialCloseQuantity(managePosition.positionAmt, manageClosePercent, symbolRules[managePosition.symbol]?.marketStepSize ?? symbolRules[managePosition.symbol]?.stepSize ?? '1')}</b></div><input className="binance-range" style={{ '--range-progress': `${manageClosePercent}%` } as React.CSSProperties} type="range" min="0" max="100" step="1" value={manageClosePercent} onChange={(event) => { const percent = Number(event.target.value); setManageClosePercent(percent); setManageQuantity(partialCloseQuantity(managePosition.positionAmt, percent, symbolRules[managePosition.symbol]?.marketStepSize ?? symbolRules[managePosition.symbol]?.stepSize ?? '1')) }} /><div className="partial-close-scale"><span>快速选择</span><div className="range-marks">{[25, 50, 75, 100].map((percent) => <button type="button" key={percent} className={manageClosePercent === percent ? 'selected' : ''} onClick={() => { setManageClosePercent(percent); setManageQuantity(partialCloseQuantity(managePosition.positionAmt, percent, symbolRules[managePosition.symbol]?.marketStepSize ?? symbolRules[managePosition.symbol]?.stepSize ?? '1')) }}>{percent}%</button>)}</div></div><div className="partial-close-actions"><button type="button" className="partial-button" onClick={() => void closeManagedPosition(false)} disabled={manageBusy || manageClosePercent <= 0}>部分平仓</button><button type="button" className="close-all-button" onClick={() => void closeManagedPosition(true)} disabled={manageBusy}>全部平仓</button></div></div>{manageMessage && <div className="order-message" role="status">{manageMessage}</div>}<small className="position-modal-note">止盈止损将替换该方向同类保护单；清空已存在的价格可移除对应保护单。</small></div></div>}
-    <nav className="mobile-nav"><button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>⌂<span>交易</span></button><button className={mobileMarketsOpen ? 'active' : ''} onClick={() => setMobileMarketsOpen(true)}>⌁<span>行情</span></button><button className={tab === 'order' && !mobileMarketsOpen ? 'active' : ''} onClick={() => { setTab('order'); document.getElementById('trade-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>＋<span>下单</span></button><button className={tab === 'ai' && !mobileMarketsOpen ? 'active' : ''} onClick={() => { setTab('ai'); document.getElementById('trade-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>✦<span>AI 解释层</span></button><button onClick={() => document.querySelector('.bottom-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>☻<span>账户</span></button></nav>
+    <nav className="mobile-nav"><button className={workspaceView === 'markets' ? 'active' : ''} onClick={() => setWorkspaceView('markets')}>⌂<span>交易</span></button><button className={workspaceView === 'training' ? 'active' : ''} onClick={() => setWorkspaceView('training')}>◈<span>模型训练</span></button><button className={mobileMarketsOpen ? 'active' : ''} onClick={() => setMobileMarketsOpen(true)}>⌁<span>行情</span></button><button className={tab === 'order' && !mobileMarketsOpen ? 'active' : ''} onClick={() => { setWorkspaceView('markets'); setTab('order'); document.getElementById('trade-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>＋<span>下单</span></button><button className={tab === 'ai' && !mobileMarketsOpen ? 'active' : ''} onClick={() => { setWorkspaceView('markets'); setTab('ai'); document.getElementById('trade-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>✦<span>AI 解释层</span></button><button onClick={() => { setWorkspaceView('markets'); document.querySelector('.bottom-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>☻<span>账户</span></button></nav>
   </div>
 }
 
