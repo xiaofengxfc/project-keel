@@ -67,7 +67,6 @@ const predictionTimeoutMs = Number.isFinite(configuredPredictionTimeoutMs) && co
   ? Math.min(Math.round(configuredPredictionTimeoutMs), 30_000)
   : 10_000
 const predictionDispatcher = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost)(?::|\/)/i.test(predictionServiceUrl) ? new Agent() : undefined
-const explanationAccuracyGate = 0.8
 let serverTimeOffsetMs = 0
 let serverTimeSyncAt = 0
 
@@ -273,6 +272,34 @@ app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, rep
 })
 
 app.get('/api/prediction/train/status', async () => predictionTrainingJob)
+
+app.get<{ Querystring: { symbol?: string; interval?: string; horizonBars?: string } }>('/api/prediction/validation/metrics', async (request, reply) => {
+  const { symbol, interval, horizonBars } = request.query
+  if (symbol && !/^[A-Z0-9]{3,20}$/i.test(symbol)) return reply.code(400).send({ error: 'symbol 格式无效' })
+  if (interval && !['15m', '1h', '4h', '1d'].includes(interval)) return reply.code(400).send({ error: 'interval 必须是 15m、1h、4h 或 1d' })
+  const parsedHorizon = horizonBars === undefined ? undefined : Number(horizonBars)
+  if (parsedHorizon !== undefined && (!Number.isInteger(parsedHorizon) || parsedHorizon < 1 || parsedHorizon > 100)) return reply.code(400).send({ error: 'horizonBars 必须是 1 到 100' })
+  try {
+    const predictionUrl = new URL(predictionServiceUrl)
+    const metricsUrl = new URL('/validation/metrics', predictionUrl)
+    if (symbol) metricsUrl.searchParams.set('symbol', symbol.toUpperCase())
+    if (interval) metricsUrl.searchParams.set('interval', interval)
+    if (parsedHorizon !== undefined) metricsUrl.searchParams.set('horizonBars', String(parsedHorizon))
+    const response = await fetch(metricsUrl, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(predictionTimeoutMs),
+      ...(predictionDispatcher ? { dispatcher: predictionDispatcher } : {}),
+    })
+    const payload = await response.json() as unknown
+    if (!response.ok) {
+      const message = payload && typeof payload === 'object' && 'detail' in payload && typeof payload.detail === 'string' ? payload.detail : `验证服务返回 ${response.status}`
+      return reply.code(503).send({ error: message })
+    }
+    return payload
+  } catch (error) {
+    return reply.code(503).send({ error: error instanceof Error ? `前向验证暂不可用：${error.message}` : '前向验证暂不可用' })
+  }
+})
 
 app.post<{ Body: { interval?: string; symbolCount?: number; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
   if (predictionTrainingJob.running || predictionTrainingStartInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。' })
@@ -772,23 +799,18 @@ type ExplanationContext = {
   trends?: Array<{ id: number; start: { time: number; price: number }; end: { time: number; price: number } }>
 }
 
-app.post<{ Body: { question: string; context: ExplanationContext } }>('/api/assistant', async (request, reply) => {
+app.post<{ Body: { question?: string; context?: ExplanationContext } }>('/api/assistant', async (request, reply) => {
   if (!aiModel || !aiBaseUrl) return reply.code(503).send({ error: '本地服务器尚未配置 OpenAI 兼容 AI 服务。' })
-  const question = request.body?.question?.trim()
-  if (!question) return reply.code(400).send({ error: '请输入问题' })
   const context = request.body.context
-  const measuredAccuracy = context?.prediction?.validation?.accuracy
-  const validationSamples = context?.prediction?.validation?.testSamples
-  if (!context?.prediction || typeof measuredAccuracy !== 'number' || measuredAccuracy < explanationAccuracyGate || typeof validationSamples !== 'number' || validationSamples < 500) {
-    return { answer: '当前通用预测模型尚未通过 80% 独立测试准确率门槛，暂无足够依据可供解释。请等待模型重新训练和验证。' }
-  }
+  if (!context?.prediction) return { answer: '当前还没有可解释的模型预测，请等待最新已收盘 K 线和预测结果。' }
+  const question = request.body?.question?.trim() || '请自动解释当前模型预测的方向、上涨下跌中性概率、主要数据依据、风险和失效条件。只解释当前上下文，不生成交易指令。'
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (aiKey) headers.Authorization = `Bearer ${aiKey}`
     const requestBody = {
       model: aiModel,
       messages: [
-        { role: 'system', content: '你是 KEEL 的 AI 解释层，服务于 Binance USDⓈ-M Futures K 线预测。你不是独立预测器，也不是下单顾问；只能解释上下文中本地通用预测模型已经给出的方向、概率、置信度、预测周期、验证指标和近期已收盘 K 线。绝对不要自行改写概率、补造数据、声称保证正确率、生成确定性的买卖指令、入场价、止盈止损、杠杆或仓位。只使用本次上下文，不声称拿到了未提供的实时行情。若预测为空、数据不足、模型过期、验证指标缺失或概率接近，应明确写“暂无足够依据”，不要猜测。用简短中文纯文本回答，固定包含四段：模型结论、数据依据、风险与失效条件、解释边界。模型方向为 NEUTRAL 时解释为信号不足；低置信度时优先建议观望。所有内容仅用于理解模型，不构成投资建议，也不会自动下单。不要使用 Markdown、星号、井号、反引号、项目符号或代码围栏。' },
+        { role: 'system', content: '你是 KEEL 的自动 AI 解释层，服务于 Binance USDⓈ-M Futures K 线预测。你不是独立预测器，也不是下单顾问；只能解释上下文中本地通用模型给出的方向、概率、置信度、预测周期、验证指标和近期已收盘 K 线。上涨、下跌、中性概率已经由数值模型计算并在界面单独显示；不要重复这些数字、不要改写或计算概率。绝对不要补造数据、声称保证正确率、生成买卖指令、入场价、止盈止损、杠杆或仓位。只使用本次上下文，不声称拿到了未提供的实时行情。验证准确率偏低、样本不足、输入数据不足、模型过期或概率接近时，应明确说明模型表现/证据有限并指出不确定性，不要隐藏或夸大预测。用简短中文纯文本回答，固定包含四段：预测解读、数据依据、风险与失效条件、解释边界。方向为 NEUTRAL 时解释为信号不明确；禁止给出交易建议。所有内容仅用于理解模型，不构成投资建议，也不会自动下单。不要使用 Markdown、星号、井号、反引号、项目符号或代码围栏。' },
         { role: 'user', content: `当前上下文：${JSON.stringify(context)}\n\n问题：${question}` },
       ],
       temperature: 0.4,

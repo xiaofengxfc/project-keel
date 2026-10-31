@@ -1,15 +1,17 @@
 """Collect data and promote a validated global model locally.
 
 This is deliberately an opt-in, one-shot job. Run it from a scheduler after
-deciding the symbol list and interval in the environment; it never changes a
-model unless the candidate is no worse than the current model on both tracked
-test metrics. The model remains a single pooled model for all symbols.
+deciding the symbol list and interval in the environment. Candidates are
+compared against the incumbent on the same purged chronological test fold
+when the incumbent feature schema can be aligned by name. The model remains
+a single pooled model.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -21,6 +23,52 @@ from pathlib import Path
 def metric(metadata: dict, name: str, default: float) -> float:
     value = metadata.get("metrics", {}).get(name, default)
     return float(value) if isinstance(value, (int, float)) else default
+
+
+def finite_metric(metadata: dict, name: str, fallback: str | None = None) -> float | None:
+    value = metadata.get("metrics", {}).get(name)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        if fallback is None:
+            return None
+        value = metadata.get("metrics", {}).get(fallback)
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(float(value)) else None
+
+
+def candidate_status(candidate: dict, current: dict | None, min_test_samples: int) -> str | None:
+    metrics = candidate.get("metrics", {})
+    test_samples = metrics.get("testSamples", 0)
+    if not isinstance(test_samples, int) or test_samples < min_test_samples:
+        return f"候选模型测试样本不足：{test_samples}<{min_test_samples}"
+    candidate_accuracy = finite_metric(candidate, "accuracy")
+    candidate_brier = finite_metric(candidate, "brier")
+    candidate_balanced = finite_metric(candidate, "balancedAccuracy", "accuracy")
+    candidate_f1 = finite_metric(candidate, "macroF1", "accuracy")
+    values = (candidate_accuracy, candidate_brier, candidate_balanced, candidate_f1)
+    if any(value is None for value in values):
+        return "候选模型缺少有限的准确率、Brier、平衡准确率或宏 F1 指标"
+    if not 0 <= candidate_accuracy <= 1 or not 0 <= candidate_brier <= 2 or not 0 <= candidate_balanced <= 1 or not 0 <= candidate_f1 <= 1:
+        return "候选模型评估指标超出有效范围"
+    if current is None:
+        return None
+    comparison = candidate.get("baselineComparison", {})
+    comparison_metrics = comparison.get("metrics", {}) if comparison.get("compatible") is True else {}
+    if comparison_metrics:
+        baseline = {"metrics": comparison_metrics}
+        baseline_brier = finite_metric(baseline, "brier")
+        baseline_balanced = finite_metric(baseline, "balancedAccuracy", "accuracy")
+        baseline_f1 = finite_metric(baseline, "macroF1", "accuracy")
+        if baseline_brier is None or baseline_balanced is None or baseline_f1 is None or not 0 <= baseline_brier <= 2 or not 0 <= baseline_balanced <= 1 or not 0 <= baseline_f1 <= 1:
+            return "同一未来测试集上的 incumbent 比较指标无效"
+        if candidate_brier > baseline_brier:
+            return f"候选模型 Brier 未改善：{candidate_brier:.4f}>{baseline_brier:.4f}"
+        if candidate_balanced < baseline_balanced:
+            return f"候选模型平衡准确率未改善：{candidate_balanced:.4f}<{baseline_balanced:.4f}"
+        if candidate_f1 < baseline_f1:
+            return f"候选模型宏 F1 未改善：{candidate_f1:.4f}<{baseline_f1:.4f}"
+        return None
+    if candidate.get("featureNames") != current.get("featureNames"):
+        return "无法在同一未来测试集比较 incumbent；候选模型未晋级，请先解决特征兼容性并完成公平比较"
+    return "无法在同一未来测试集比较 incumbent；请等待前向验证数据后晋级"
 
 
 def run_module(module: str, args: list[str]) -> None:
@@ -35,7 +83,6 @@ def main() -> None:
     parser.add_argument("--start-time", type=int, default=int(os.getenv("PREDICTION_START_TIME", "1704067200000")))
     parser.add_argument("--data-dir", type=Path, default=Path(os.getenv("PREDICTION_DATA_DIR", "data")))
     parser.add_argument("--model-root", type=Path, default=Path(os.getenv("PREDICTION_MODEL_DIR", "prediction/models")))
-    parser.add_argument("--min-accuracy", type=float, default=float(os.getenv("PREDICTION_MIN_ACCURACY", "0.8")))
     parser.add_argument("--min-test-samples", type=int, default=int(os.getenv("PREDICTION_MIN_TEST_SAMPLES", "500")))
     args = parser.parse_args()
     symbols = sorted({item.strip().upper() for item in args.symbols.split(",") if item.strip()})
@@ -59,24 +106,24 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="keel-model-") as temporary:
         candidate = Path(temporary) / args.interval
-        run_module("prediction.train", [
+        train_args = [
             "--input", *input_paths, "--interval", args.interval,
             "--horizon-bars", os.getenv("PREDICTION_HORIZON_BARS", "3"),
             "--output-dir", str(candidate),
-        ])
+        ]
+        if (target / "direction.txt").is_file() and (target / "metadata.json").is_file():
+            train_args.extend(["--baseline-model-dir", str(target)])
+        run_module("prediction.train", train_args)
         metadata = json.loads((candidate / "metadata.json").read_text(encoding="utf-8"))
-        accuracy = metric(metadata, "accuracy", 0.0)
-        brier = metric(metadata, "brier", float("inf"))
-        test_samples = int(metadata.get("metrics", {}).get("testSamples", 0))
-        if accuracy < args.min_accuracy or test_samples < args.min_test_samples:
-            raise SystemExit(f"候选模型未达到门槛：accuracy={accuracy:.4f}, testSamples={test_samples}")
         current_metadata_path = target / "metadata.json"
+        current = None
         if current_metadata_path.exists():
             current = json.loads(current_metadata_path.read_text(encoding="utf-8"))
-            current_accuracy = metric(current, "accuracy", 0.0)
-            current_brier = metric(current, "brier", float("inf"))
-            if accuracy < current_accuracy or brier > current_brier:
-                raise SystemExit(f"候选模型未优于当前模型：accuracy={accuracy:.4f}/{current_accuracy:.4f}, brier={brier:.4f}/{current_brier:.4f}")
+        status = candidate_status(metadata, current, args.min_test_samples)
+        if status:
+            raise SystemExit(status)
+        accuracy = metric(metadata, "accuracy", 0.0)
+        brier = metric(metadata, "brier", float("inf"))
         # Prepare the complete candidate beside the live model first.  Moving
         # directories is atomic on the same volume, so a failed promotion can
         # restore the previous model instead of leaving the service without a

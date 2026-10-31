@@ -4,6 +4,7 @@ logs
 __pycache__/
 *.py[cod]
 prediction/models/
+prediction/validation/
 data/
 npm-debug.log*
 yarn-debug.log*

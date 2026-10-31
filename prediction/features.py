@@ -29,6 +29,12 @@ FEATURE_NAMES = (
     "volume_ratio20",
     "volume_return_5",
     "trend_efficiency20",
+    "return_50",
+    "realized_volatility20",
+    "realized_volatility50",
+    "rolling_range_pct20",
+    "volume_zscore20",
+    "trend_momentum_5_20",
 )
 
 
@@ -148,6 +154,15 @@ def feature_row(candles: Sequence[Candle]) -> list[float]:
     atr = _atr(candles, 14)
     volumes = [candle.volume for candle in candles[-21:]]
     average_volume = sum(volumes[-20:]) / min(20, len(volumes))
+    prior_volumes = volumes[:-1]
+    prior_volume_mean = sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    prior_volume_variance = sum((value - prior_volume_mean) ** 2 for value in prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    prior_volume_std = prior_volume_variance ** 0.5
+    returns_20 = [closes[index] / closes[index - 1] - 1.0 for index in range(max(1, len(closes) - 20), len(closes))]
+    returns_50 = [closes[index] / closes[index - 1] - 1.0 for index in range(max(1, len(closes) - 50), len(closes))]
+    volatility_20 = (sum((value - sum(returns_20) / len(returns_20)) ** 2 for value in returns_20) / len(returns_20)) ** 0.5 if returns_20 else 0.0
+    volatility_50 = (sum((value - sum(returns_50) / len(returns_50)) ** 2 for value in returns_50) / len(returns_50)) ** 0.5 if returns_50 else 0.0
+    rolling_range_pct20 = sum((candle.high - candle.low) / max(candle.close, 1e-12) for candle in candles[-20:]) / min(20, len(candles))
     movement = sum(abs(closes[index] - closes[index - 1]) for index in range(max(1, len(closes) - 20), len(closes)))
     net_movement = abs(closes[-1] - closes[max(0, len(closes) - 21)])
     values = [
@@ -163,6 +178,12 @@ def feature_row(candles: Sequence[Candle]) -> list[float]:
         latest.volume / average_volume if average_volume > 0 else 1.0,
         volumes[-1] / max(volumes[-6], 1e-12) - 1.0,
         net_movement / movement if movement > 0 else 0.0,
+        closes[-1] / closes[-51] - 1.0 if len(closes) > 50 else 0.0,
+        volatility_20,
+        volatility_50,
+        rolling_range_pct20,
+        (latest.volume - prior_volume_mean) / prior_volume_std if prior_volume_std > 1e-12 else 0.0,
+        returns[-3] - returns[-1] if len(returns) >= 5 else 0.0,
     ]
     if len(values) != len(FEATURE_NAMES) or not all(isfinite(value) for value in values):
         raise ValueError("feature extraction produced a non-finite value")

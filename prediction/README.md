@@ -67,7 +67,19 @@ POST /predict
 python -m prediction.auto_train --symbols BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT --interval 1h
 ```
 
-重训练任务默认要求候选模型在独立测试集达到 80% 准确率（可用 `PREDICTION_MIN_ACCURACY` 配置），样本不足或准确率未达标时不会晋级。当前已训练模型测试准确率约 38.6%，因此会被前端和 AI 解释层的 80% 门槛拦下，不提供方向信号。准确率门槛是发布筛选规则，不代表未来命中率保证；滚动回测、覆盖率和实盘表现仍需持续跟踪。
+重训练任务按时间顺序建立训练、校准和独立测试折，并 purge 标签跨界样本，要求足够的独立测试样本，报告准确率、平衡准确率、宏 F1、覆盖率和 Brier 分数；当前模型可兼容时，会在同一测试折上做比较，无法公平比较时不会自动晋级。该留出评估不等同于“未见币种”测试，也不证明模型能泛化到任意资产；应在不同币种与市场阶段持续评估。不会用固定准确率百分比隐藏方向概率。界面显示上涨、下跌和中性概率，并同时呈现测试指标与持续累积的前向验证结果；这些历史指标不保证未来表现。
 
 重训练完成后重启本地推理服务，使其加载新模型。不要把自动重训练直接连接到下单逻辑。
+
+## 前向验证记录
+
+推理服务会把每次预测的方向概率和必要的结算信息保存在本机 SQLite 数据库中，后续收到目标 K 线后计算真实类别、命中率和 Brier 分数。数据库默认位于 `prediction/validation/predictions.sqlite3`，默认保留 90 天；只保存预测结果及用于结算的收盘价，不保存原始 K 线。该目录已加入 `.gitignore`，不会随源码提交。
+
+可通过 `PREDICTION_VALIDATION_DB` 指定数据库文件，或用 `PREDICTION_VALIDATION_DIR` 指定数据库目录；`PREDICTION_VALIDATION_RETENTION_DAYS` 可调整保留天数。服务提供只含聚合指标的 `GET /validation/metrics`，可选按 `symbol`、`interval` 和 `horizonBars` 筛选，例如：
+
+```text
+GET /validation/metrics?symbol=BTCUSDT&interval=1h&horizonBars=3
+```
+
+如果本地数据库不可写，预测仍可正常运行，只是前向验证记录暂不可用。
 

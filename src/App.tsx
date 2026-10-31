@@ -6,14 +6,16 @@ import { isMarketExecution, isPriceOrder, isTriggeredOrder, requiresAlgoEndpoint
 import { allSymbolLeverageOptions, leverageForBalancePercent, leverageLimitForNotional, maximumLeverageForBrackets, orderSizeAtBalancePercent, partialCloseQuantity, quantityFromAmount, quoteAsset, type LeverageBracket, type OrderAmountUnit } from './binanceTrading'
 import { parseWatchlist, reorderWatchlist, WATCHLIST_STORAGE_KEY } from './watchlist'
 import { DEFAULT_CHART_INDICATORS, type ChartIndicatorKey, calculateTechnicalIndicators } from './technicalIndicators'
-import { isPredictionEligible, MIN_PREDICTION_ACCURACY, parsePrediction, type PredictionResult } from './prediction'
+import { parsePrediction, type PredictionResult } from './prediction'
 
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume?: number }
 type Tool = 'cursor' | 'horizontal' | 'trend'
 type Line = { id: number; price: number; label: string; color: string; deletable?: boolean }
 type Trend = { id: number; start: { time: number; price: number }; end: { time: number; price: number } }
 type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; predictionConfigured: boolean; environment?: string; websocketBaseUrl?: string }
-type TrainingStatus = { running: boolean; phase?: string; output?: string; error?: string | null; startedAt?: number; finishedAt?: number; interval?: Interval; symbols?: string[]; metrics?: { accuracy?: number; brier?: number; testSamples?: number } }
+type TrainingStatus = { running: boolean; phase?: string; output?: string; error?: string | null; startedAt?: number; finishedAt?: number; interval?: Interval; symbols?: string[]; metrics?: { accuracy?: number; balancedAccuracy?: number; macroF1?: number; confidenceCoverage?: number; selectiveAccuracy?: number; brier?: number; testSamples?: number } }
+type ForwardValidationMetricSet = { predictions: number; settled: number; pending: number; accuracy: number | null; balancedAccuracy: number | null; brier: number | null; byClass?: Record<string, { actual: number; recall: number }> }
+type ForwardValidationMetrics = ForwardValidationMetricSet & { byModelVersion?: Record<string, ForwardValidationMetricSet> }
 type MarketQuote = { price: number; change: number }
 type Interval = '15m' | '1h' | '4h' | '1d'
 type MarketTransport = 'connecting' | 'websocket' | 'rest' | 'offline'
@@ -37,6 +39,7 @@ const orderTypeOptions: Array<{ value: BinanceOrderType; label: string }> = [
 const workingTypeOptions: Array<{ value: 'MARK_PRICE' | 'CONTRACT_PRICE'; label: string }> = [{ value: 'CONTRACT_PRICE', label: '最新价格' }, { value: 'MARK_PRICE', label: '标记价格' }]
 
 const defaultLines: Line[] = []
+const defaultTrends: Trend[] = []
 function formatPrice(value: number | null) {
   return value === null || !Number.isFinite(value) ? '—' : value.toLocaleString(undefined, { maximumFractionDigits: value > 100 ? 2 : 5 })
 }
@@ -48,8 +51,25 @@ const KLINE_REFRESH_MS: Record<Interval, number> = { '15m': 5_000, '1h': 8_000, 
 // tearing down a healthy connection in a reconnect loop.
 const KLINE_WATCHDOG_MS = 45_000
 const WEBSOCKET_RECONNECT_COOLDOWN_MS = 120_000
+const MAX_AI_DISPLAY_CHARACTERS = 4500
 const klineCache = new Map<string, { rows: unknown[][]; fetchedAt: number }>()
 const klineRequests = new Map<string, Promise<unknown[][]>>()
+
+function cleanAiText(value: string) {
+  return value.replace(/```[\s\S]*?```/g, '').replace(/^\s*[#*>`]+\s?/gm, '').replace(/\*+/g, '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function limitAiText(value: string) {
+  const characters = Array.from(value)
+  if (characters.length <= MAX_AI_DISPLAY_CHARACTERS) return value
+  return `${characters.slice(0, MAX_AI_DISPLAY_CHARACTERS).join('').trimEnd()}\n\n（回复较长，已截取前 ${MAX_AI_DISPLAY_CHARACTERS} 个字符）`
+}
+
+function aiErrorText(error: unknown) {
+  const message = error instanceof Error ? error.message : ''
+  if (/abort|timeout|timed out/i.test(message)) return 'AI 服务响应超时，请稍后重试。'
+  return message || '请求失败，请检查 OpenAI 兼容接口配置。'
+}
 
 async function requestKlines(symbol: string, interval: Interval, endTime?: number, limit = KLINE_PAGE_SIZE, forceRefresh = false) {
   const cacheKey = `${symbol}:${interval}:${endTime ?? 'latest'}:${limit}`
@@ -237,11 +257,12 @@ function App() {
   const [leverageBracketsError, setLeverageBracketsError] = useState('')
   const [leverageBracketsReloadKey, setLeverageBracketsReloadKey] = useState(0)
   const [symbolRules, setSymbolRules] = useState<Record<string, { stepSize: string; minQty: string; marketStepSize?: string; marketMinQty?: string }>>({})
-  const [question, setQuestion] = useState('')
   const [aiBusy, setAiBusy] = useState(false)
+  const [aiExplanationRefreshKey, setAiExplanationRefreshKey] = useState(0)
+  const aiExplanationRequestKeyRef = useRef('')
   const [symbolSearch, setSymbolSearch] = useState('')
   const [mobileMarketsOpen, setMobileMarketsOpen] = useState(false)
-  const [messages, setMessages] = useState<string[]>(['你好，我是 AI 解释层。我会解释通用 K 线预测模型的概率、依据、风险和失效条件，不会替你做确定性交易决策。'])
+  const [aiExplanation, setAiExplanation] = useState('等待最新模型预测后自动生成解释。')
   const [health, setHealth] = useState<Health>({ privateApiConfigured: false, tradingEnabled: false, aiConfigured: false, predictionConfigured: false })
   const [orderMessage, setOrderMessage] = useState('')
   const [accountBalance, setAccountBalance] = useState<string | null>(null)
@@ -280,6 +301,9 @@ function App() {
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ running: false })
   const [trainingRequestError, setTrainingRequestError] = useState('')
   const trainingStatusRequestInFlightRef = useRef(false)
+  const [forwardMetrics, setForwardMetrics] = useState<ForwardValidationMetrics | null>(null)
+  const [forwardMetricsError, setForwardMetricsError] = useState('')
+  const [forwardMetricsLoading, setForwardMetricsLoading] = useState(false)
   const historyRequestId = useRef(0)
   const tradingSettingsSymbol = useRef('')
   const tickerMessageAt = useRef<Record<string, number>>({})
@@ -299,7 +323,7 @@ function App() {
         : '行情连接中'
   const selected = availableSymbols.find((item) => item.symbol === active) ?? { symbol: active, name: '等待选择交易对', icon: '◆', color: '#5f6c7b' }
   const lines = storedLines[active] ?? defaultLines
-  const trends = storedTrends[active] ?? []
+  const trends = storedTrends[active] ?? defaultTrends
   const filteredSymbols = useMemo(() => {
     const query = symbolSearch.trim().toLowerCase()
     if (!query) return watchlist.map((symbol) => availableSymbols.find((item) => item.symbol === symbol) ?? { symbol, name: '当前 Binance 环境中不可用', ...symbolVisual(symbol.replace(/USDT$/, '')) })
@@ -773,11 +797,6 @@ function App() {
       const parsed = parsePrediction(payload)
       if (!parsed) throw new Error('预测结果格式无效')
       if (parsed.dataThrough !== predictionDataThrough) throw new Error('预测结果不是当前最新 K 线')
-      if (!isPredictionEligible(parsed)) {
-        const measuredAccuracy = parsed.validation?.accuracy
-        const measured = measuredAccuracy === undefined ? '未知' : `${(measuredAccuracy * 100).toFixed(1)}%`
-        throw new Error(`模型独立测试准确率为 ${measured}，未达到 ${Math.round(MIN_PREDICTION_ACCURACY * 100)}% 门槛，暂不提供方向信号`)
-      }
       return parsed
     }).then((result) => {
       if (!cancelled) setPrediction(result)
@@ -808,7 +827,88 @@ function App() {
     const timer = window.setInterval(() => { if (trainingStatus.running) void refreshTrainingStatus() }, 1500)
     return () => { cancelled = true; window.clearInterval(timer) }
   }, [trainingStatus.running])
+  useEffect(() => {
+    if (workspaceView !== 'training') return
+    let cancelled = false
+    let timer: number | undefined
+    let requestInFlight = false
+    const refreshForwardMetrics = async () => {
+      if (requestInFlight) return
+      requestInFlight = true
+      setForwardMetricsLoading(true)
+      const query = new URLSearchParams({ interval: trainingInterval, horizonBars: '3' })
+      if (active) query.set('symbol', active)
+      try {
+        const response = await fetch(`/api/prediction/validation/metrics?${query}`, { cache: 'no-store' })
+        const payload = await response.json() as ForwardValidationMetrics & { error?: string }
+        if (!response.ok) throw new Error(payload.error ?? '前向验证暂不可用')
+        if (!cancelled) {
+          setForwardMetrics(payload)
+          setForwardMetricsError('')
+        }
+      } catch (error) {
+        if (!cancelled) setForwardMetricsError(error instanceof Error ? error.message : '前向验证暂不可用')
+      } finally {
+        requestInFlight = false
+        if (!cancelled) setForwardMetricsLoading(false)
+      }
+    }
+    void refreshForwardMetrics()
+    timer = window.setInterval(() => void refreshForwardMetrics(), 30_000)
+    return () => { cancelled = true; if (timer !== undefined) window.clearInterval(timer) }
+  }, [active, trainingInterval, workspaceView])
   const chartIndicatorValues = useMemo(() => calculateTechnicalIndicators(chartCandles), [chartCandles])
+  const aiContextRef = useRef({ price: last, candles: chartCandles, indicators: chartIndicatorValues, lines, trends })
+  useEffect(() => {
+    aiContextRef.current = { price: last, candles: chartCandles, indicators: chartIndicatorValues, lines, trends }
+  }, [chartCandles, chartIndicatorValues, last, lines, trends])
+  useEffect(() => {
+    let cancelled = false
+    const controller = new AbortController()
+    if (!prediction) {
+      setAiBusy(false)
+      setAiExplanation(health.predictionConfigured ? '等待最新模型预测后自动生成解释。' : '本地预测服务暂不可用，暂时无法生成解释。')
+      aiExplanationRequestKeyRef.current = ''
+      return () => { cancelled = true; controller.abort() }
+    }
+    if (!health.aiConfigured) {
+      setAiBusy(false)
+      setAiExplanation('AI 服务尚未配置。当前模型概率仍可查看，请检查本地 AI 服务设置。')
+      return () => { cancelled = true; controller.abort() }
+    }
+    const requestKey = `${active}:${interval}:${prediction.version}:${prediction.dataThrough}:${aiExplanationRefreshKey}`
+    if (aiExplanationRequestKeyRef.current === requestKey) return () => { cancelled = true; controller.abort() }
+    aiExplanationRequestKeyRef.current = requestKey
+    setAiBusy(true)
+    setAiExplanation('正在结合模型预测和近期已收盘 K 线生成解释…')
+    const aiContext = aiContextRef.current
+    void fetch('/api/assistant', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({ context: {
+        symbol: active,
+        interval,
+        price: aiContext.price,
+        prediction,
+        candles: aiContext.candles.slice(0, -1).slice(-60).map(({ time, open, high, low, close, volume }) => ({ time, open, high, low, close, volume })),
+        indicators: aiContext.indicators,
+        manualLines: aiContext.lines.map(({ label, price: value }) => ({ label, price: value })),
+        trends: aiContext.trends,
+      } }),
+    }).then(async (response) => {
+      const data = await response.json() as { answer?: string; error?: string }
+      if (!response.ok) throw new Error(data.error ?? 'AI 解释服务不可用')
+      return data.answer?.trim() || 'AI 暂未返回解释。'
+    }).then((answer) => {
+      if (!cancelled) setAiExplanation(limitAiText(cleanAiText(answer)))
+    }).catch((error: unknown) => {
+      if (!cancelled && !(error instanceof DOMException && error.name === 'AbortError')) {
+        setAiExplanation(aiErrorText(error))
+      }
+    }).finally(() => { if (!cancelled) setAiBusy(false) })
+    return () => { cancelled = true; controller.abort() }
+  }, [active, aiExplanationRefreshKey, health.aiConfigured, health.predictionConfigured, interval, prediction, predictionDataThrough])
   const activeQuoteAsset = quoteAsset(active)
   const displayedAmountUnitLabel = amountUnit === 'asset' ? active.replace(activeQuoteAsset, '') : activeQuoteAsset
   const chartPaneCount = (['volume', 'rsi', 'macd', 'stochastic', 'atr', 'adx', 'obv'] as ChartIndicatorKey[]).filter((key) => chartIndicators[key]).length
@@ -1074,20 +1174,6 @@ function App() {
     } catch (error) { setOrderMessage(error instanceof Error ? error.message : '更新持仓模式失败') }
   }
 
-  const maxAiDisplayCharacters = 4500
-  const cleanAiText = (value: string) => value.replace(/```[\s\S]*?```/g, '').replace(/^\s*[#*>`]+\s?/gm, '').replace(/\*+/g, '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-  const limitAiText = (value: string) => {
-    const characters = Array.from(value)
-    if (characters.length <= maxAiDisplayCharacters) return value
-    return `${characters.slice(0, maxAiDisplayCharacters).join('').trimEnd()}\n\n（回复较长，已截取前 ${maxAiDisplayCharacters} 个字符）`
-  }
-
-  const aiErrorText = (error: unknown) => {
-    const message = error instanceof Error ? error.message : ''
-    if (/abort|timeout|timed out/i.test(message)) return 'AI 服务响应超时，请稍后重试。'
-    return message || '请求失败，请检查 OpenAI 兼容接口配置。'
-  }
-
   const startModelTraining = async () => {
     if (trainingStatus.running) return
     const symbolCount = Number(trainingSymbolCount)
@@ -1117,20 +1203,6 @@ function App() {
     }
   }
 
-  const ask = async (requestedPrompt?: string) => {
-    const prompt = (requestedPrompt ?? question).trim()
-    if (!prompt || aiBusy || !health.aiConfigured) return
-    setMessages((current) => [...current, `你：${prompt}`]); setQuestion(''); setAiBusy(true)
-    try {
-      const response = await fetch('/api/assistant', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: prompt, context: { symbol: active, interval, price: last, prediction, candles: candles.slice(0, -1).slice(-60).map(({ time, open, high, low, close, volume }) => ({ time, open, high, low, close, volume })), indicators: chartIndicatorValues, manualLines: lines.map(({ label, price: value }) => ({ label, price: value })), trends } }) })
-      const data = await response.json() as { answer?: string; error?: string }
-      if (!response.ok) throw new Error(data.error ?? 'AI 服务不可用')
-      setMessages((current) => [...current, `AI：${limitAiText(cleanAiText(data.answer ?? '没有得到有效回复。'))}`])
-    } catch (error) { setMessages((current) => [...current, `AI：${aiErrorText(error)}`]) }
-    finally { setAiBusy(false) }
-  }
-
-
   const indicatorPanel = indicatorsOpen ? <div className="indicator-panel">
     <div className="indicator-panel-head"><div><span className="eyebrow">INDICATORS</span><b>图表指标</b></div><button type="button" onClick={() => setIndicatorsOpen(false)} aria-label="关闭指标设置">×</button></div>
     <div className="indicator-columns"><div><strong>图表显示</strong>{chartIndicatorOptions.map(({ key, label }) => <label className="indicator-check" key={`chart-${key}`}><input type="checkbox" checked={chartIndicators[key]} onChange={(event) => setChartIndicators((current) => ({ ...current, [key]: event.target.checked }))} /><span>{label}</span></label>)}</div></div>
@@ -1156,13 +1228,22 @@ function App() {
       <section className="training-run-card">
         <div className="training-section-heading"><span>02</span><div><h2>训练进度与结果</h2><p>训练完成后会自动验证并尝试热加载</p></div></div>
         {trainingStatus.running ? <div className="training-progress" role="status"><i /><div><strong>正在训练 {trainingStatus.interval ?? trainingInterval} 通用模型</strong><span>{trainingStatus.symbols?.length ? trainingStatus.symbols.join(' · ') : '正在随机选取币种'}</span></div></div>
-          : trainingStatus.phase === 'completed' ? <div className="training-page-result" role="status"><strong>训练完成，模型已保存</strong>{trainingStatus.symbols?.length ? <small>训练币种：{trainingStatus.symbols.join(' · ')}</small> : null}<div><span>验证准确率 <b>{trainingStatus.metrics?.accuracy === undefined ? '—' : `${(trainingStatus.metrics.accuracy * 100).toFixed(1)}%`}</b></span><span>Brier <b>{trainingStatus.metrics?.brier === undefined ? '—' : trainingStatus.metrics.brier.toFixed(4)}</b></span><span>测试样本 <b>{trainingStatus.metrics?.testSamples?.toLocaleString() ?? '—'}</b></span></div></div>
+          : trainingStatus.phase === 'completed' ? <div className="training-page-result" role="status"><strong>训练完成，模型已保存</strong>{trainingStatus.symbols?.length ? <small>训练币种：{trainingStatus.symbols.join(' · ')}</small> : null}<div><span>准确率 <b>{trainingStatus.metrics?.accuracy === undefined ? '—' : `${(trainingStatus.metrics.accuracy * 100).toFixed(1)}%`}</b></span><span>平衡准确率 <b>{trainingStatus.metrics?.balancedAccuracy === undefined ? '—' : `${(trainingStatus.metrics.balancedAccuracy * 100).toFixed(1)}%`}</b></span><span>Macro F1 <b>{trainingStatus.metrics?.macroF1 === undefined ? '—' : trainingStatus.metrics.macroF1.toFixed(3)}</b></span><span>Brier <b>{trainingStatus.metrics?.brier === undefined ? '—' : trainingStatus.metrics.brier.toFixed(4)}</b></span><span>测试样本 <b>{trainingStatus.metrics?.testSamples?.toLocaleString() ?? '—'}</b></span></div><small>测试集指标反映历史留出数据，不保证未来表现。</small></div>
             : trainingStatus.phase === 'failed' ? <div className="training-idle failed" role="status">训练未完成，请查看错误信息或日志后重试。</div>
               : <div className="training-idle">尚未启动训练。模型文件会保存在 <code>prediction/models/&lt;周期&gt;</code>。</div>}
         {trainingStatus.output && <details className="training-page-log"><summary>查看训练日志</summary><pre>{trainingStatus.output}</pre></details>}
       </section>
+      <section className="forward-validation-card">
+        <div className="training-section-heading"><span>03</span><div><h2>模拟前向验证</h2><p>{active || '当前币种'} · {trainingInterval} · 预测未来 3 根已收盘 K 线 · 按模型版本统计</p></div><small className="forward-validation-refresh">{forwardMetricsLoading ? '更新中…' : '每 30 秒刷新'}</small></div>
+        {forwardMetricsError ? <div className="training-validation-empty">{forwardMetricsError}</div>
+          : !forwardMetrics || forwardMetrics.predictions === 0 ? <div className="training-validation-empty">尚无前向验证记录。生成预测后，待目标 K 线收盘便会开始累计真实后验结果。</div>
+            : <>
+              <div className="forward-validation-models">{Object.entries(forwardMetrics.byModelVersion ?? {}).map(([version, metrics]) => <section className="forward-validation-model" key={version}><strong>模型 {version}</strong><div className="forward-validation-metrics"><span>已结算样本<b>{metrics.settled.toLocaleString()}</b></span><span>待结算<b>{metrics.pending.toLocaleString()}</b></span><span>准确率<b>{metrics.accuracy === null ? '—' : `${(metrics.accuracy * 100).toFixed(1)}%`}</b></span><span>平衡准确率<b>{metrics.balancedAccuracy === null ? '—' : `${(metrics.balancedAccuracy * 100).toFixed(1)}%`}</b></span><span>Brier<b>{metrics.brier === null ? '—' : metrics.brier.toFixed(4)}</b></span></div>{metrics.byClass && <div className="forward-validation-classes">{['DOWN', 'NEUTRAL', 'UP'].map((label) => { const item = metrics.byClass?.[label]; return <span key={label}>{label === 'DOWN' ? '下跌' : label === 'UP' ? '上涨' : '中性'}真实样本 {item?.actual.toLocaleString() ?? '0'} · 召回率 {item ? `${(item.recall * 100).toFixed(1)}%` : '—'}</span> })}</div>}</section>)}</div>
+              <small className="forward-validation-disclaimer">这是模型上线后的历史前向验证统计，不代表未来保证；尚未扣除手续费、滑点和资金费。</small>
+            </>}
+      </section>
     </div>
-    <div className="training-page-note"><strong>验证说明</strong><span>候选模型至少需要 500 个独立测试样本，准确率达到 80%，且评估指标不劣于当前模型，才会更新线上模型。</span></div>
+    <div className="training-page-note"><strong>模型发布说明</strong><span>候选模型需通过最低测试样本检查；同特征体系下会在同一时间留出集比较 Brier、平衡准确率和宏 F1。界面显示各模型版本的前向验证结果。当前时间留出测试覆盖已采集币种，不代表对未见币种的泛化或未来表现保证。</span></div>
   </section>
   const predictionPanel = <div className="prediction-card prediction-card-main">
     <div className="prediction-card-head"><strong>通用 K 线预测</strong><small>{prediction?.model ?? 'LightGBM / ONNX'}</small></div>
@@ -1212,7 +1293,7 @@ function App() {
         onOpenMarkets={() => { setWorkspaceView('markets'); setMobileMarketsOpen(false) }}
       />
       {workspaceView === 'training' ? trainingPage : <>
-      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><span className="prediction-header-label">通用预测 · {prediction ? (prediction.direction === 'UP' ? '上涨' : prediction.direction === 'DOWN' ? '下跌' : '信号不足') : predictionError ? '方向信号暂不可用' : '等待模型'}</span><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}{predictionPanel}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small><span className="toolbar-spacer" /><span className={`chart-status ${marketTransport === 'websocket' || marketTransport === 'rest' ? 'online' : ''}`}><i />{marketTransportLabel}{marketTransport === 'websocket' ? ` · ${chartPaneCount} 个指标窗` : ''}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}><LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期' : '手动周期'} · 通用预测 · Binance USDⓈ-M · {marketTransport === 'websocket' ? '实时' : marketTransport === 'rest' ? 'REST补偿' : '等待连接'}</span></div></section>
+      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><span className="prediction-header-label">通用预测 · {prediction ? (prediction.direction === 'UP' ? '上涨' : prediction.direction === 'DOWN' ? '下跌' : '信号不足') : predictionError ? '方向信号暂不可用' : '等待模型'}</span><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}{predictionPanel}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small><span className="toolbar-spacer" /><span className={`chart-status ${marketTransport === 'websocket' || marketTransport === 'rest' ? 'online' : ''}`}><i />{marketTransportLabel}{marketTransport === 'websocket' ? ` · ${chartPaneCount} 个指标窗` : ''}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}>{prediction && <div className="prediction-chart-overlay" aria-label="当前模型概率"><div><strong>预测概率</strong><small>未来 {prediction.horizonBars} 根 {prediction.interval} K 线</small></div><span className="prediction-chart-up">上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span className="prediction-chart-down">下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span className="prediction-chart-neutral">中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>}<LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期' : '手动周期'} · 通用预测 · Binance USDⓈ-M · {marketTransport === 'websocket' ? '实时' : marketTransport === 'rest' ? 'REST补偿' : '等待连接'}</span></div></section>
       <aside id="trade-panel" className="trade-panel panel">
         <div className="tabs"><button className={tab === 'order' ? 'active' : ''} onClick={() => setTab('order')}>下单</button><button className={tab === 'ai' ? 'active' : ''} onClick={() => setTab('ai')}>AI 解释层 <span className="new-dot" /></button></div>
         {tab === 'order' ? <div className="order-content">
@@ -1250,7 +1331,7 @@ function App() {
           {activeMinQty && Number(activeMinQty) > 0 && <small className="order-min-note">最小下单数量 {activeMinQty}{isMarketExecution(orderType) ? '（市价）' : ''}</small>}
           {orderMessage && <div className="order-message" role="status">{orderMessage}</div>}
           <div className="api-note"><span>⌁</span><div><b>{health.tradingEnabled ? (health.environment === 'testnet' ? '测试网下单已启用' : '实盘交易已启用') : health.environment === 'testnet' ? '测试网下单未启用' : '实盘交易未启用'}</b><small>{health.privateApiConfigured ? (health.tradingEnabled ? '仅点击上方下单按钮时提交订单' : 'API 已配置，安全开关关闭，订单提交不可用') : '请在后端配置所选环境的 Binance API Key'}</small></div></div>
-        </div> : <div className="ai-content"><div className="ai-intro"><div className="ai-spark">✦</div><h3>预测解释层</h3><p>解释通用 K 线预测模型的方向、概率、依据与风险。</p><small className={health.aiConfigured ? 'ai-ready' : 'ai-unavailable'}>{health.aiConfigured ? 'AI 已连接 · 可按需调用分析' : 'AI 尚未配置，请检查本地服务设置'}</small></div><div className="messages">{messages.map((message, index) => <div className={message.startsWith('你：') ? 'message user' : 'message'} key={`${message}-${index}`}>{message}</div>)}</div><div className="quick-prompts"><button onClick={() => setQuestion('为什么模型偏向这个方向？')}>为什么是这个方向？</button><button onClick={() => setQuestion('解释当前预测的风险和失效条件')}>风险和失效条件</button></div><div className="ai-input"><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void ask() } }} placeholder="询问模型预测的依据、风险或失效条件..." /><button onClick={() => void ask()} disabled={!health.aiConfigured || aiBusy}>{aiBusy ? '…' : '↑'}</button></div><small className="ai-disclaimer">AI 仅解释模型结果，不构成投资建议，也不会自动下单。</small></div>}
+        </div> : <div className="ai-content"><div className="ai-intro"><div className="ai-spark">✦</div><h3>自动预测解释</h3><p>每次更新模型预测后，自动解释概率、数据依据和风险条件。</p><small className={health.aiConfigured ? 'ai-ready' : 'ai-unavailable'}>{health.aiConfigured ? aiBusy ? 'AI 正在分析当前预测…' : 'AI 已连接 · 随模型自动更新' : 'AI 尚未配置，请检查本地服务设置'}</small></div>{prediction && <div className="ai-prediction-summary"><strong>{prediction.direction === 'UP' ? '模型方向：上涨' : prediction.direction === 'DOWN' ? '模型方向：下跌' : '模型方向：中性'}</strong><span>未来 {prediction.horizonBars} 根 {prediction.interval} K 线</span><div><span className="up">上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span className="down">下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span>中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div><small>独立测试准确率 {prediction.validation?.accuracy === undefined ? '—' : `${(prediction.validation.accuracy * 100).toFixed(1)}%`} · 样本 {prediction.validation?.testSamples?.toLocaleString() ?? '—'}</small></div>}<div className="ai-explanation-output" aria-live="polite">{aiExplanation}</div><button type="button" className="ai-refresh-button" onClick={() => setAiExplanationRefreshKey((value) => value + 1)} disabled={aiBusy || !health.aiConfigured || !prediction}>{aiBusy ? '分析中…' : '重新分析'}</button><small className="ai-disclaimer">AI 仅解释数值模型结果，不修改概率，不构成投资建议，也不会自动下单。</small></div>}
       </aside>
       </>}
     </main>

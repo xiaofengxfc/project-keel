@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { assessPrediction, isPredictionEligible, parsePrediction } from '../src/prediction.ts'
+import { assessPrediction, parsePrediction } from '../src/prediction.ts'
 
 const valid = {
   model: 'lightgbm_direction', version: '2026-10-31.1', generatedAt: 1_700_000_100_000, dataThrough: 1_700_000_000,
@@ -15,12 +15,10 @@ test('prediction schema accepts calibrated probabilities and rejects malformed v
   assert.equal(parsePrediction({ ...valid, generatedAt: 'now' }), null)
 })
 
-test('directional prediction is withheld until independent test accuracy reaches 80 percent', () => {
-  const lowAccuracy = parsePrediction({ ...valid, validation: { accuracy: 0.799, brier: 0.5, testSamples: 1000 } })
-  const passingAccuracy = parsePrediction({ ...valid, validation: { accuracy: 0.8, brier: 0.5, testSamples: 1000 } })
-  assert.equal(isPredictionEligible(lowAccuracy), false)
-  assert.equal(isPredictionEligible(passingAccuracy), true)
-  assert.equal(isPredictionEligible(parsePrediction(valid)), false)
+test('prediction probabilities remain available while independent test metrics are reported', () => {
+  const prediction = parsePrediction({ ...valid, validation: { accuracy: 0.386, brier: 0.5, testSamples: 1000 } })
+  assert.equal(prediction?.probabilityUp, 0.7)
+  assert.equal(prediction?.validation?.accuracy, 0.386)
 })
 
 test('prediction assessment keeps low-confidence and conflicting signals out of confirmation', () => {
