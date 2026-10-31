@@ -61,7 +61,9 @@ async function requestKlines(symbol: string, interval: Interval, endTime?: numbe
   const request = (async () => {
     const response = await fetch(`/api/market/klines?${query}`)
     if (!response.ok) throw new Error(`Binance 行情请求失败：${response.status}`)
-    return await response.json() as unknown[][]
+    const rows = await response.json() as unknown
+    if (!Array.isArray(rows) || rows.some((row) => !Array.isArray(row) || row.length < 6)) throw new Error('Binance K 线数据格式无效')
+    return rows as unknown[][]
   })()
   klineRequests.set(cacheKey, request)
   try {
@@ -74,7 +76,15 @@ async function requestKlines(symbol: string, interval: Interval, endTime?: numbe
 }
 
 function parseKlines(rows: unknown[][]): Candle[] {
-  return rows.map((row) => ({ time: Number(row[0]) / 1000, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) }))
+  return rows.map((row) => {
+    const time = Number(row[0]) / 1000
+    const open = Number(row[1])
+    const high = Number(row[2])
+    const low = Number(row[3])
+    const close = Number(row[4])
+    const volume = Number(row[5])
+    return { time, open, high, low, close, volume }
+  }).filter((candle) => Number.isFinite(candle.time) && candle.time > 0 && [candle.open, candle.high, candle.low, candle.close].every((value) => Number.isFinite(value) && value > 0) && candle.high >= Math.max(candle.open, candle.close, candle.low) && candle.low <= Math.min(candle.open, candle.close, candle.high))
 }
 
 function symbolVisual(baseAsset: string): Pick<SymbolInfo, 'icon' | 'color'> {
@@ -620,11 +630,13 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    setLeverageBrackets([])
-    setLeverageBracketsSymbol('')
-    setLeverageBracketsError('')
-    setLeverageBracketsLoading(false)
-    if (!health.privateApiConfigured || !active) return
+    if (!health.privateApiConfigured || !active) {
+      setLeverageBrackets([])
+      setLeverageBracketsSymbol('')
+      setLeverageBracketsError('')
+      setLeverageBracketsLoading(false)
+      return
+    }
     setLeverageBracketsLoading(true)
     void fetch(`/api/account/leverage-brackets?symbol=${encodeURIComponent(active)}`).then(async (response) => {
       const result = await response.json() as { error?: string; brackets?: LeverageBracket[] }
