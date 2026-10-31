@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import './training.css'
 import LiveChart from './LiveChart'
 import type { BinanceSymbolCatalogItem } from './binanceSymbols'
 import { isMarketExecution, isPriceOrder, isTriggeredOrder, requiresAlgoEndpoint, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput, type BinanceOrderType } from './binanceOrders'
