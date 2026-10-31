@@ -40,11 +40,30 @@ def is_not_promoted(return_code: int, output: str) -> bool:
 
 
 def short_error(output: str, return_code: int) -> str:
-    for line in reversed(output.splitlines()):
+    # Child processes print ANSI-colored tracebacks on Windows terminals. Strip
+    # those sequences before storing an error in the UI/state JSON.
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    lines = output.splitlines()
+    for line in reversed(lines):
         stripped = line.strip()
         if stripped.startswith("NOT_PROMOTED:"):
             return stripped.removeprefix("NOT_PROMOTED:").strip()
-        if stripped and not stripped.startswith(PROGRESS_PREFIX):
+
+    # subprocess.run(check=True) adds a CalledProcessError after the original
+    # traceback. Prefer the underlying exception so the training UI reports
+    # the useful cause (for example a file permission or network error).
+    exception_lines = [
+        line.strip()
+        for line in lines
+        if re.match(r"^[\w.]+(?:Error|Exception|Interrupt)\s*:", line.strip())
+        and not line.strip().startswith("subprocess.CalledProcessError:")
+    ]
+    if exception_lines:
+        return exception_lines[0][-500:]
+
+    for line in reversed(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith((PROGRESS_PREFIX, "Traceback ", "File \"")):
             return stripped[-500:]
     return f"训练脚本退出，代码 {return_code}"
 
@@ -171,7 +190,16 @@ def run_interval(
         if len(output_lines) > 2_000:
             output_lines = output_lines[-1_500:]
         append_log(log_path, line)
-        progress = load_progress(progress_path, job_id)
+        progress: dict[str, Any] = {}
+        if line.startswith(PROGRESS_PREFIX):
+            try:
+                decoded = json.loads(line[len(PROGRESS_PREFIX):])
+                if isinstance(decoded, dict):
+                    progress = decoded
+            except json.JSONDecodeError:
+                pass
+        if not progress:
+            progress = load_progress(progress_path, job_id)
         if progress:
             for field in ("phase", "currentSymbol", "symbolIndex", "symbolCount", "pagesFetched", "rowsFetched", "message"):
                 if field in progress:
@@ -180,18 +208,6 @@ def run_interval(
                 state["currentInterval"] = progress["interval"]
             state["output"] = ""
             atomic_json(state_path, state)
-        elif line.startswith(PROGRESS_PREFIX):
-            try:
-                progress = json.loads(line[len(PROGRESS_PREFIX):])
-                if isinstance(progress, dict):
-                    if progress.get("interval"):
-                        state["currentInterval"] = progress["interval"]
-                    for field in ("phase", "currentSymbol", "symbolIndex", "symbolCount", "pagesFetched", "rowsFetched", "message"):
-                        if field in progress:
-                            state[field if field != "phase" else "stage"] = progress[field]
-                    atomic_json(state_path, state)
-            except json.JSONDecodeError:
-                pass
 
     return_code = process.wait()
     output = "\n".join(output_lines)
@@ -277,6 +293,7 @@ def main() -> int:
     state["currentSymbol"] = None
     state.pop("workerPid", None)
     atomic_json(args.state_file, state)
+    successful = sum(1 for interval in intervals if results.get(interval, {}).get("phase") == "completed")
     append_log(args.log_file, f"任务完成：{state['phase']}，成功周期 {successful}/{len(intervals)}")
     return 1 if state["phase"] == "failed" else 0
 
