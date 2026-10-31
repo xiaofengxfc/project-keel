@@ -367,7 +367,7 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
     if (takeProfit && (isLong ? Number(takeProfit) <= referencePrice : Number(takeProfit) >= referencePrice)) return reply.code(400).send({ error: isLong ? `多仓止盈价必须高于${workingType === 'MARK_PRICE' ? '标记' : '最新'}价格 (${referencePrice})` : `空仓止盈价必须低于${workingType === 'MARK_PRICE' ? '标记' : '最新'}价格 (${referencePrice})` })
     const [standardOrders, algoOrders] = await Promise.all([
       binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true),
-      binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true).catch(() => []),
+      binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true),
     ])
     const existingOrders = [...standardOrders, ...algoOrders.map((order) => ({ ...order, orderId: order.algoId, type: order.orderType ?? order.type, stopPrice: order.triggerPrice ?? order.stopPrice, isAlgoOrder: true }))] as Array<{ orderId: number; symbol: string; type: string; side: string; positionSide?: string; closePosition?: boolean | string; stopPrice?: string | number; workingType?: string; isAlgoOrder?: boolean }>
     const protectSide = side
