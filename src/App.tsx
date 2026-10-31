@@ -575,56 +575,63 @@ function App() {
   useEffect(() => {
     let cancelled = false
     if (!health.privateApiConfigured) return
-    void Promise.resolve().then(async () => {
+    type FetchResult = { response?: Response; error?: unknown }
+    const safeFetch = (input: RequestInfo | URL): Promise<FetchResult> => fetch(input).then((response) => ({ response })).catch((error) => ({ error }))
+    const readJson = async <T,>(result: FetchResult, label: string) => {
+      if (!result.response) return { data: null as T | null, error: `${label}读取失败：${result.error instanceof Error ? result.error.message : '网络请求失败'}` }
+      if (!result.response.ok) {
+        let detail = ''
+        try { detail = ((await result.response.clone().json()) as { error?: string }).error ?? '' } catch { /* 忽略无法解析的错误响应。 */ }
+        return { data: null as T | null, error: `${label}读取失败${detail ? `：${detail}` : ''}` }
+      }
+      try { return { data: await result.response.json() as T, error: null } }
+      catch { return { data: null as T | null, error: `${label}响应格式无效` } }
+    }
+    void (async () => {
       if (cancelled) return
       setOrdersLoading(true)
       setOrdersError('')
-      const responses = await Promise.all([
-        fetch('/api/account'),
-        fetch('/api/positions'),
-        fetch(`/api/open-orders${active ? `?symbol=${encodeURIComponent(active)}` : ''}`),
-        active ? fetch(`/api/order-history?symbol=${encodeURIComponent(active)}&limit=50`) : Promise.resolve(null),
-        active ? fetch(`/api/account/trades?symbol=${encodeURIComponent(active)}&limit=100`) : Promise.resolve(null),
+      const [accountResult, positionsResult, openOrdersResult, historyResult, tradesResult] = await Promise.all([
+        safeFetch('/api/account'),
+        safeFetch('/api/positions'),
+        safeFetch(`/api/open-orders${active ? `?symbol=${encodeURIComponent(active)}` : ''}`),
+        active ? safeFetch(`/api/order-history?symbol=${encodeURIComponent(active)}&limit=50`) : Promise.resolve<FetchResult>({}),
+        active ? safeFetch(`/api/account/trades?symbol=${encodeURIComponent(active)}&limit=100`) : Promise.resolve<FetchResult>({}),
       ])
-      return responses
-    }).then(async (responses) => {
-      if (!responses) return
-      const [accountResponse, positionsResponse, openOrdersResponse, historyResponse, tradesResponse] = responses
       if (cancelled) return
       const errors: string[] = []
-      if (accountResponse.ok) setAccountBalance(((await accountResponse.json()) as { availableBalance: string }).availableBalance)
-      else { setAccountBalance(null); errors.push('账户余额') }
-      if (positionsResponse.ok) {
-        const rows = await positionsResponse.json() as Array<{ symbol: string; positionAmt: string; entryPrice: string; markPrice: string; liquidationPrice: string; unRealizedProfit: string; leverage: string; marginType: string; positionSide: string }>
-        if (!cancelled) {
-          const activeSettings = rows.find((row) => row.symbol === active)
-          if (tradingSettingsSymbol.current !== active) {
-            tradingSettingsSymbol.current = active
-            const currentLeverage = Number(activeSettings?.leverage)
-            setLeverage(Number.isInteger(currentLeverage) && currentLeverage > 0 ? String(currentLeverage) : '10')
-            setMarginType(activeSettings?.marginType.toUpperCase() === 'ISOLATED' ? 'ISOLATED' : 'CROSSED')
-          }
-          setPositions(rows.map((row) => ({ symbol: row.symbol, positionAmt: Number(row.positionAmt), entryPrice: Number(row.entryPrice), markPrice: Number(row.markPrice), liquidationPrice: Number(row.liquidationPrice), unrealizedProfit: Number(row.unRealizedProfit), leverage: Number(row.leverage), marginType: row.marginType, positionSide: row.positionSide })).filter((row) => Number.isFinite(row.positionAmt) && row.positionAmt !== 0))
+      const account = await readJson<{ availableBalance: string }>(accountResult, '账户余额')
+      if (account.data) setAccountBalance(account.data.availableBalance)
+      else { setAccountBalance(null); if (account.error) errors.push(account.error) }
+      const positions = await readJson<Array<{ symbol: string; positionAmt: string; entryPrice: string; markPrice: string; liquidationPrice: string; unRealizedProfit: string; leverage: string; marginType: string; positionSide: string }>>(positionsResult, '持仓')
+      if (positions.data) {
+        const rows = positions.data
+        const activeSettings = rows.find((row) => row.symbol === active)
+        if (tradingSettingsSymbol.current !== active) {
+          tradingSettingsSymbol.current = active
+          const currentLeverage = Number(activeSettings?.leverage)
+          setLeverage(Number.isInteger(currentLeverage) && currentLeverage > 0 ? String(currentLeverage) : '10')
+          setMarginType(activeSettings?.marginType.toUpperCase() === 'ISOLATED' ? 'ISOLATED' : 'CROSSED')
         }
-      } else { setPositions([]); errors.push('持仓') }
-      if (openOrdersResponse.ok) {
-        const rows = await openOrdersResponse.json() as OrderRow[]
-        if (!cancelled) setOpenOrders(rows.map((row) => ({ ...row, price: Number(row.price), stopPrice: Number(row.stopPrice), origQty: Number(row.origQty), executedQty: Number(row.executedQty), time: Number(row.time), updateTime: Number(row.updateTime) })))
-      } else { setOpenOrders([]); errors.push('当前委托') }
-      if (historyResponse?.ok) {
-        const rows = await historyResponse.json() as OrderRow[]
-        if (!cancelled) setOrderHistory(rows.map((row) => ({ ...row, price: Number(row.price), stopPrice: Number(row.stopPrice), origQty: Number(row.origQty), executedQty: Number(row.executedQty), time: Number(row.time), updateTime: Number(row.updateTime) })).sort((left, right) => right.time - left.time))
+        setPositions(rows.map((row) => ({ symbol: row.symbol, positionAmt: Number(row.positionAmt), entryPrice: Number(row.entryPrice), markPrice: Number(row.markPrice), liquidationPrice: Number(row.liquidationPrice), unrealizedProfit: Number(row.unRealizedProfit), leverage: Number(row.leverage), marginType: row.marginType, positionSide: row.positionSide })).filter((row) => Number.isFinite(row.positionAmt) && row.positionAmt !== 0))
+      } else { setPositions([]); if (positions.error) errors.push(positions.error) }
+      const openOrders = await readJson<OrderRow[]>(openOrdersResult, '当前委托')
+      if (openOrders.data) setOpenOrders(openOrders.data.map((row) => ({ ...row, price: Number(row.price), stopPrice: Number(row.stopPrice), origQty: Number(row.origQty), executedQty: Number(row.executedQty), time: Number(row.time), updateTime: Number(row.updateTime) })))
+      else { setOpenOrders([]); if (openOrders.error) errors.push(openOrders.error) }
+      if (active) {
+        const history = await readJson<OrderRow[]>(historyResult, '历史订单')
+        if (history.data) setOrderHistory(history.data.map((row) => ({ ...row, price: Number(row.price), stopPrice: Number(row.stopPrice), origQty: Number(row.origQty), executedQty: Number(row.executedQty), time: Number(row.time), updateTime: Number(row.updateTime) })).sort((left, right) => right.time - left.time))
+        else { setOrderHistory([]); if (history.error) errors.push(history.error) }
+        const trades = await readJson<Array<{ id: number; symbol: string; orderId: number; side: 'BUY' | 'SELL'; positionSide?: string; price: string; qty: string; time: number }>>(tradesResult, '成交记录')
+        if (trades.data) setTrades(trades.data.map((row) => ({ ...row, positionSide: row.positionSide ?? 'BOTH', price: Number(row.price), qty: Number(row.qty), time: Number(row.time) })).filter((row) => Number.isFinite(row.price) && row.price > 0))
+        else { setTrades([]); if (trades.error) errors.push(trades.error) }
       } else {
         setOrderHistory([])
-        if (active) errors.push('历史订单')
+        setTrades([])
       }
-      if (tradesResponse?.ok) {
-        const rows = await tradesResponse.json() as Array<{ id: number; symbol: string; orderId: number; side: 'BUY' | 'SELL'; positionSide?: string; price: string; qty: string; time: number }>
-        if (!cancelled) setTrades(rows.map((row) => ({ ...row, positionSide: row.positionSide ?? 'BOTH', price: Number(row.price), qty: Number(row.qty), time: Number(row.time) })).filter((row) => Number.isFinite(row.price) && row.price > 0))
-      } else if (active) errors.push('成交记录')
-      if (errors.length && !cancelled) setOrdersError(`${errors.join('、')}读取失败，请检查私有 API 权限后刷新`)
-    }).catch(() => {
-      if (!cancelled) setOrdersError('读取持仓与订单数据失败，请检查本地服务后刷新')
+      if (errors.length && !cancelled) setOrdersError(errors.join('；'))
+    })().catch((error) => {
+      if (!cancelled) setOrdersError(error instanceof Error ? `读取账户数据失败：${error.message}` : '读取账户数据失败，请稍后刷新')
     }).finally(() => { if (!cancelled) setOrdersLoading(false) })
     return () => { cancelled = true }
   }, [active, health.privateApiConfigured, privateDataRefreshKey])
@@ -988,7 +995,13 @@ function App() {
     } catch (error) { setOrderMessage(error instanceof Error ? error.message : '更新持仓模式失败') }
   }
 
+  const maxAiDisplayCharacters = 4500
   const cleanAiText = (value: string) => value.replace(/```[\s\S]*?```/g, '').replace(/^\s*[#*>`]+\s?/gm, '').replace(/\*+/g, '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+  const limitAiText = (value: string) => {
+    const characters = Array.from(value)
+    if (characters.length <= maxAiDisplayCharacters) return value
+    return `${characters.slice(0, maxAiDisplayCharacters).join('').trimEnd()}\n\n（回复较长，已截取前 ${maxAiDisplayCharacters} 个字符）`
+  }
 
   const aiErrorText = (error: unknown) => {
     const message = error instanceof Error ? error.message : ''
@@ -1004,7 +1017,7 @@ function App() {
       const response = await fetch('/api/assistant', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: prompt, context: { symbol: active, interval, price: last, analysis: { environment: analysis.environment, direction: analysis.direction, status: analysis.status, entry: analysis.entry, support: analysis.support, resistance: analysis.resistance, stopLoss: analysis.stopLoss, takeProfit: analysis.takeProfit, riskReward: analysis.rr }, lines: [...analysisLines, ...lines].map(({ label, price: value }) => ({ label, price: value })), trends, candles: candles.slice(0, -1).slice(-40).map(({ time, open, high, low, close }) => ({ time, open, high, low, close })) } }) })
       const data = await response.json() as { answer?: string; error?: string }
       if (!response.ok) throw new Error(data.error ?? 'AI 服务不可用')
-      setMessages((current) => [...current, `AI：${cleanAiText(data.answer ?? '没有得到有效回复。')}`])
+      setMessages((current) => [...current, `AI：${limitAiText(cleanAiText(data.answer ?? '没有得到有效回复。'))}`])
     } catch (error) { setMessages((current) => [...current, `AI：${aiErrorText(error)}`]) }
     finally { setAiBusy(false) }
   }
@@ -1081,7 +1094,7 @@ function App() {
           {isTriggeredOrder(orderType) && <label>触发价格<div className="input-unit"><input type="number" min="0" step="any" value={stopPrice} onChange={(event) => setStopPrice(event.target.value)} placeholder="输入触发价" /><span>USDT</span></div></label>}
           {orderType === 'TRAILING_STOP_MARKET' && <>
             <label>激活价格（可选）<div className="input-unit"><input type="number" min="0" step="any" value={activationPrice} onChange={(event) => setActivationPrice(event.target.value)} placeholder="留空则立即激活" /><span>USDT</span></div></label>
-            <label>回调率<div className="input-unit"><input type="number" min="0.1" max="5" step="0.1" value={callbackRate} onChange={(event) => setCallbackRate(event.target.value)} /><span>%</span></div></label>
+            <label>回调率<div className="input-unit"><input type="number" min="0.1" max="20" step="0.1" value={callbackRate} onChange={(event) => setCallbackRate(event.target.value)} /><span>%</span></div></label>
           </>}
           {isPriceOrder(orderType) && <label>有效期<select value={timeInForce} onChange={(event) => setTimeInForce(event.target.value as typeof timeInForce)}><option value="GTC">GTC · 撤销前有效</option><option value="IOC">IOC · 立即成交剩余撤销</option><option value="FOK">FOK · 全部立即成交</option><option value="GTX">GTX · 只做 Maker</option></select></label>}
           {!closePosition && <label>数量<div className="input-unit"><select value={amountUnit} onChange={(event) => changeAmountUnit(event.target.value as OrderAmountUnit)}><option value="asset">币</option><option value="usdt">{activeQuoteAsset}</option></select><input type="number" min="0" step="any" value={orderPercent > 0 && activeSliderSize ? String(activeSliderSize.inputAmount) : qty} onChange={(event) => { setQty(event.target.value); setOrderPercent(0) }} placeholder="输入数量" /><span>{displayedAmountUnitLabel}</span></div><small className="order-estimate">{quantityPreview ? `按 ${activeStepSize ?? '—'} 步长对齐后数量 ${quantityPreview.quantity} · 预估名义价值 ${formatPrice(quantityPreview.notional)} ${activeQuoteAsset}` : '预估名义价值 —'}</small></label>}
@@ -1128,7 +1141,7 @@ function App() {
       </div>
       {ordersError && <div className="account-error" role="alert">{ordersError}</div>}
       {ipError && <div className="account-error" role="alert">{ipError}</div>}
-      {!health.privateApiConfigured ? <div className="empty-state"><div className="empty-icon">⌁</div><div><b>未连接私有 API</b><span>配置 Binance 只读 API Key 后可读取真实账户持仓与订单</span></div></div> : ordersLoading && !positions.length && !openOrders.length && !orderHistory.length && !trades.length ? <div className="empty-state"><div className="empty-icon">⌁</div><div><b>正在同步账户数据</b><span>读取 Binance USDⓈ-M Futures 私有接口</span></div></div> : bottomTab === 'positions' ? positions.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>持仓数量</th><th>开仓均价</th><th>标记价格</th><th>未实现盈亏</th><th>杠杆</th><th>操作</th></tr></thead><tbody>{positions.map((position, index) => <tr key={`${position.symbol}-${position.positionSide}-${index}`}><td><b>{position.symbol}</b><small>{position.positionSide === 'BOTH' ? position.positionAmt > 0 ? '单向多仓' : '单向空仓' : position.positionSide === 'LONG' ? '多仓' : '空仓'}</small></td><td className={position.positionAmt >= 0 ? 'up' : 'down'}>{formatPrice(position.positionAmt)}</td><td>{formatPrice(position.entryPrice)}</td><td>{formatPrice(position.markPrice)}</td><td className={position.unrealizedProfit >= 0 ? 'up' : 'down'}>{formatPrice(position.unrealizedProfit)} USDT</td><td>{position.leverage}x</td><td><button type="button" className="manage-position" onClick={() => openPositionEditor(position)}>管理</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无持仓</b><span>当前账户没有未平仓的合约持仓</span></div></div> : bottomTab === 'openOrders' ? openOrders.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>订单类型</th><th>价格 / 触发价</th><th>数量 / 已成交</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{openOrders.map((order) => <tr key={`${order.symbol}-${order.orderId}`}><td><b>{order.symbol}</b><small className={order.side === 'BUY' ? 'up' : 'down'}>{order.side === 'BUY' ? '买入' : '卖出'}</small></td><td>{orderTypeLabel(order.type)}</td><td>{formatOrderPrice(order)}</td><td>{formatPrice(order.origQty)} / {formatPrice(order.executedQty)}</td><td>{formatOrderTime(order.updateTime || order.time)}</td><td><button type="button" className="cancel-order" onClick={() => void cancelOrder(order)} disabled={cancellingOrderId === order.orderId}>{cancellingOrderId === order.orderId ? '撤销中…' : '撤单'}</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无当前委托</b><span>交易对 {active} 的未完成订单会显示在这里</span></div></div> : bottomTab === 'history' ? orderHistory.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>订单类型</th><th>价格 / 触发价</th><th>数量 / 已成交</th><th>状态</th><th>更新时间</th></tr></thead><tbody>{orderHistory.map((order) => <tr key={`${order.symbol}-${order.orderId}`}><td><b>{order.symbol}</b><small className={order.side === 'BUY' ? 'up' : 'down'}>{order.side === 'BUY' ? '买入' : '卖出'}</small></td><td>{orderTypeLabel(order.type)}</td><td>{formatOrderPrice(order)}</td><td>{formatPrice(order.origQty)} / {formatPrice(order.executedQty)}</td><td>{orderStatusLabel(order.status)}</td><td>{formatOrderTime(order.updateTime || order.time)}</td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无历史订单</b><span>历史记录按当前交易对 {active} 查询</span></div></div> : trades.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>方向</th><th>成交价</th><th>数量</th><th>时间</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><b>{trade.symbol}</b><small>{trade.positionSide === 'LONG' ? '多仓' : trade.positionSide === 'SHORT' ? '空仓' : '单向'}</small></td><td className={trade.side === 'BUY' ? 'up' : 'down'}>{trade.side === 'BUY' ? '买入' : '卖出'}</td><td>{formatPrice(trade.price)}</td><td>{formatPrice(trade.qty)}</td><td>{formatOrderTime(trade.time)}</td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无成交记录</b><span>历史记录按当前交易对 {active} 查询</span></div></div>}
+      {!health.privateApiConfigured ? <div className="empty-state"><div className="empty-icon">⌁</div><div><b>未连接私有 API</b><span>配置 Binance 只读 API Key 后可读取真实账户持仓与订单</span></div></div> : ordersLoading && !positions.length && !openOrders.length && !orderHistory.length && !trades.length ? <div className="empty-state"><div className="empty-icon">⌁</div><div><b>正在同步账户数据</b><span>读取 Binance USDⓈ-M Futures 私有接口</span></div></div> : bottomTab === 'positions' ? positions.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>持仓数量</th><th>开仓均价</th><th>标记价格</th><th>未实现盈亏</th><th>杠杆</th><th>操作</th></tr></thead><tbody>{positions.map((position, index) => <tr key={`${position.symbol}-${position.positionSide}-${index}`}><td><b>{position.symbol}</b><small>{position.positionSide === 'BOTH' ? position.positionAmt > 0 ? '单向多仓' : '单向空仓' : position.positionSide === 'LONG' ? '多仓' : '空仓'}</small></td><td className={position.positionAmt >= 0 ? 'up' : 'down'}>{formatPrice(position.positionAmt)}</td><td>{formatPrice(position.entryPrice)}</td><td>{formatPrice(position.markPrice)}</td><td className={position.unrealizedProfit >= 0 ? 'up' : 'down'}>{formatPrice(position.unrealizedProfit)} USDT</td><td>{position.leverage}x</td><td><button type="button" className="manage-position" onClick={() => openPositionEditor(position)}>管理</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无持仓</b><span>当前账户没有未平仓的合约持仓</span></div></div> : bottomTab === 'openOrders' ? openOrders.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>订单类型</th><th>价格 / 触发价</th><th>数量 / 已成交</th><th>更新时间</th><th>操作</th></tr></thead><tbody>{openOrders.map((order) => <tr key={`${order.symbol}-${order.orderId}`}><td><b>{order.symbol}</b><small className={order.side === 'BUY' ? 'up' : 'down'}>{order.side === 'BUY' ? '买入' : '卖出'}</small></td><td>{orderTypeLabel(order.type)}</td><td>{formatOrderPrice(order)}</td><td>{formatPrice(order.origQty)} / {formatPrice(order.executedQty)}</td><td>{formatOrderTime(order.updateTime || order.time)}</td><td><button type="button" className="cancel-order" onClick={() => void cancelOrder(order)} disabled={cancellingOrderId === order.orderId}>{cancellingOrderId === order.orderId ? '撤销中…' : '撤单'}</button></td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无当前委托</b><span>交易对 {active} 的未完成订单会显示在这里</span></div></div> : bottomTab === 'history' ? orderHistory.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>订单类型</th><th>价格 / 触发价</th><th>数量 / 已成交</th><th>状态</th><th>更新时间</th></tr></thead><tbody>{orderHistory.map((order) => <tr key={`${order.symbol}-${order.orderId}`}><td><b>{order.symbol}</b><small className={order.side === 'BUY' ? 'up' : 'down'}>{order.side === 'BUY' ? '买入' : '卖出'}</small></td><td>{orderTypeLabel(order.type)}</td><td>{formatOrderPrice(order)}</td><td>{formatPrice(order.origQty)} / {formatPrice(order.executedQty)}</td><td>{orderStatusLabel(order.status)}</td><td>{formatOrderTime(order.updateTime || order.time)}</td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无历史订单</b><span>历史记录按当前交易对 {active} 查询</span></div></div> : trades.length ? <div className="account-table-wrap"><table className="account-table"><thead><tr><th>交易对 / 方向</th><th>方向</th><th>成交价</th><th>数量</th><th>时间</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><b>{trade.symbol}</b><small>{trade.positionSide === 'LONG' ? '多仓' : trade.positionSide === 'SHORT' ? '空仓' : '单向'}</small></td><td className={trade.side === 'BUY' ? 'up' : 'down'}>{trade.side === 'BUY' ? '买入' : '卖出'}</td><td>{formatPrice(trade.price)}</td><td>{formatPrice(trade.qty)}</td><td>{formatOrderTime(trade.time)}</td></tr>)}</tbody></table></div> : <div className="empty-state"><div className="empty-icon">⌁</div><div><b>暂无成交记录</b><span>成交记录按当前交易对 {active} 查询，Binance 仅支持近 3 个月</span></div></div>}
     </section>
     {managePosition && <div className="position-modal-backdrop" onClick={() => setManagePosition(null)}><div className="position-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}><div className="position-modal-head"><div><span className="eyebrow">POSITION MANAGEMENT</span><h3>{managePosition.symbol} · {managePosition.positionSide === 'SHORT' ? '空仓' : '多仓'}</h3></div><button type="button" onClick={() => setManagePosition(null)} aria-label="关闭">×</button></div><div className="position-snapshot"><span>数量 <b>{formatPrice(Math.abs(managePosition.positionAmt))}</b></span><span>开仓均价 <b>{formatPrice(managePosition.entryPrice)}</b></span><span>强平价格 <b>{formatPrice(managePosition.liquidationPrice)}</b></span></div><div className="position-modal-grid"><label>止损价格<input type="number" min="0" step="any" value={manageStopLoss} onChange={(event) => { setManageStopLoss(event.target.value); setManageStopLossChanged(true) }} /><small>留空则清除保护单</small></label><label>止盈价格<input type="number" min="0" step="any" value={manageTakeProfit} onChange={(event) => { setManageTakeProfit(event.target.value); setManageTakeProfitChanged(true) }} /><small>留空则清除保护单</small></label></div><button type="button" className="manage-primary" onClick={() => void submitManage()} disabled={manageBusy}>{manageBusy ? '提交中…' : '保存止盈止损'}</button><div className="partial-close"><div className="partial-close-head"><span>部分平仓比例</span><b>{manageClosePercent}%</b></div><div className="partial-close-quantity">预计平仓数量 <b>{partialCloseQuantity(managePosition.positionAmt, manageClosePercent, symbolRules[managePosition.symbol]?.marketStepSize ?? symbolRules[managePosition.symbol]?.stepSize ?? '1')}</b></div><input className="binance-range" style={{ '--range-progress': `${manageClosePercent}%` } as React.CSSProperties} type="range" min="0" max="100" step="1" value={manageClosePercent} onChange={(event) => { const percent = Number(event.target.value); setManageClosePercent(percent); setManageQuantity(partialCloseQuantity(managePosition.positionAmt, percent, symbolRules[managePosition.symbol]?.marketStepSize ?? symbolRules[managePosition.symbol]?.stepSize ?? '1')) }} /><div className="partial-close-scale"><span>快速选择</span><div className="range-marks">{[25, 50, 75, 100].map((percent) => <button type="button" key={percent} className={manageClosePercent === percent ? 'selected' : ''} onClick={() => { setManageClosePercent(percent); setManageQuantity(partialCloseQuantity(managePosition.positionAmt, percent, symbolRules[managePosition.symbol]?.marketStepSize ?? symbolRules[managePosition.symbol]?.stepSize ?? '1')) }}>{percent}%</button>)}</div></div><div className="partial-close-actions"><button type="button" className="partial-button" onClick={() => void closeManagedPosition(false)} disabled={manageBusy || manageClosePercent <= 0}>部分平仓</button><button type="button" className="close-all-button" onClick={() => void closeManagedPosition(true)} disabled={manageBusy}>全部平仓</button></div></div>{manageMessage && <div className="order-message" role="status">{manageMessage}</div>}<small className="position-modal-note">止盈止损将替换该方向同类保护单；清空已存在的价格可移除对应保护单。</small></div></div>}
     <nav className="mobile-nav"><button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>⌂<span>交易</span></button><button className={mobileMarketsOpen ? 'active' : ''} onClick={() => setMobileMarketsOpen(true)}>⌁<span>行情</span></button><button className={tab === 'order' && !mobileMarketsOpen ? 'active' : ''} onClick={() => { setTab('order'); document.getElementById('trade-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>＋<span>下单</span></button><button className={tab === 'ai' && !mobileMarketsOpen ? 'active' : ''} onClick={() => { setTab('ai'); document.getElementById('trade-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>✦<span>AI 助手</span></button><button onClick={() => document.querySelector('.bottom-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>☻<span>账户</span></button></nav>

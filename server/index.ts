@@ -50,6 +50,10 @@ const configuredAiTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS ?? 120_000)
 const aiTimeoutMs = Number.isFinite(configuredAiTimeoutMs) && configuredAiTimeoutMs >= 10_000
   ? Math.min(Math.round(configuredAiTimeoutMs), 300_000)
   : 120_000
+const configuredAiMaxTokens = Number(process.env.OPENAI_MAX_TOKENS ?? 900)
+const aiMaxTokens = Number.isFinite(configuredAiMaxTokens) && configuredAiMaxTokens >= 128
+  ? Math.min(Math.round(configuredAiMaxTokens), 4_096)
+  : 900
 let serverTimeOffsetMs = 0
 let serverTimeSyncAt = 0
 
@@ -93,6 +97,7 @@ async function binanceRequest<T>(method: string, path: string, params: Record<st
   if (!response.ok) {
     const code = body?.code ?? response.status
     if (code === -2015) throw new Error('Binance API Key 无效、未通过当前出口 IP 白名单，或未开启 USDⓈ-M 合约权限。请检查正式网 API 配置。')
+    if (code === -4531) throw new Error('切换持仓模式失败：CM 合约账户仍有持仓或未完成订单，请先清理 CM 持仓和订单后重试。')
     throw new Error(`Binance ${code}: ${body?.msg ?? response.statusText}`)
   }
   return body
@@ -191,7 +196,7 @@ app.get('/api/account', async (_request, reply) => {
       availableBalance: string
       totalUnrealizedProfit: string
       assets: Array<{ asset: string; walletBalance: string; availableBalance: string }>
-    }>('GET', '/fapi/v2/account', {}, true)
+    }>('GET', '/fapi/v3/account', {}, true)
     return { totalWalletBalance: account.totalWalletBalance, availableBalance: account.availableBalance, totalUnrealizedProfit: account.totalUnrealizedProfit, assets: account.assets }
   } catch (error) {
     return reply.code(503).send({ error: error instanceof Error ? error.message : '读取账户信息失败' })
@@ -200,7 +205,7 @@ app.get('/api/account', async (_request, reply) => {
 
 app.get('/api/positions', async (_request, reply) => {
   try {
-    return await binanceRequest('GET', '/fapi/v2/positionRisk', {}, true)
+    return await binanceRequest('GET', '/fapi/v3/positionRisk', {}, true)
   } catch (error) {
     return reply.code(503).send({ error: error instanceof Error ? error.message : '读取持仓失败' })
   }
@@ -272,8 +277,20 @@ app.get<{ Querystring: { symbol?: string } }>('/api/open-orders', async (request
   const symbol = request.query.symbol?.toUpperCase()
   if (symbol && !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
   try {
-    const orders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true)
-    const algoOrders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true)
+    const fetchPart = (requestPromise: Promise<Array<Record<string, unknown>>>) => requestPromise
+      .then((data) => ({ data, error: null as Error | null }))
+      .catch((error: unknown) => ({ data: null, error: error instanceof Error ? error : new Error('请求失败') }))
+    const [standardResult, algoResult] = await Promise.all([
+      fetchPart(binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true)),
+      fetchPart(binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true)),
+    ])
+    if (!standardResult.data && !algoResult.data) {
+      throw new Error(`普通委托：${standardResult.error?.message ?? '读取失败'}；条件委托：${algoResult.error?.message ?? '读取失败'}`)
+    }
+    if (!standardResult.data) app.log.warn({ err: standardResult.error, symbol }, '读取普通委托失败，返回条件委托')
+    if (!algoResult.data) app.log.warn({ err: algoResult.error, symbol }, '读取条件委托失败，返回普通委托')
+    const orders = standardResult.data ?? []
+    const algoOrders = algoResult.data ?? []
     const normalizedAlgoOrders = algoOrders.map((order) => ({
       orderId: order.algoId,
       symbol: order.symbol,
@@ -283,7 +300,7 @@ app.get<{ Querystring: { symbol?: string } }>('/api/open-orders', async (request
       closePosition: order.closePosition,
       price: order.price ?? '0',
       stopPrice: order.triggerPrice ?? order.stopPrice ?? '0',
-      origQty: order.quantity ?? order.origQty ?? '0',
+      origQty: order.quantity ?? order.origQty ?? order.baseQty ?? '0',
       executedQty: order.executedQty ?? '0',
       status: order.algoStatus ?? order.status ?? 'NEW',
       time: order.createTime ?? order.time ?? 0,
@@ -330,7 +347,7 @@ app.post<{ Body: { symbol?: string; positionSide?: string; quantity?: string } }
   if (!['BOTH', 'LONG', 'SHORT'].includes(positionSide ?? '')) return reply.code(400).send({ error: '请提供有效的持仓方向' })
   if (quantity !== undefined && (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0)) return reply.code(400).send({ error: '平仓数量必须大于 0' })
   try {
-    const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v2/positionRisk', { symbol }, true)
+    const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v3/positionRisk', { symbol }, true)
     const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide)
     const currentAmount = Number(position?.positionAmt)
     if (!position || !Number.isFinite(currentAmount) || currentAmount === 0) return reply.code(400).send({ error: '该方向当前没有可平仓位' })
@@ -386,7 +403,7 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
   protectionLocks.set(lockKey, currentLock)
   await previousLock
   try {
-    const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v2/positionRisk', { symbol }, true)
+    const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v3/positionRisk', { symbol }, true)
     const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide && Number.isFinite(Number(row.positionAmt)) && Number(row.positionAmt) !== 0)
     const amount = Number(position?.positionAmt)
     if (!position && !request.body?.side) return reply.code(400).send({ error: '没有持仓时需要提供保护单方向' })
@@ -553,20 +570,34 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (aiKey) headers.Authorization = `Bearer ${aiKey}`
-    const response = await fetch(aiChatUrl, {
+    const requestBody = {
+      model: aiModel,
+      messages: [
+        { role: 'system', content: '你是 KEEL 个人交易工作台里的中文市场分析助手，服务于 Binance USDⓈ-M Futures 图表。用户主动调用你做复核和解释；本地程序已提供交易对、周期、价格、近期K线、支撑阻力、市场环境、参考入场/止盈/止损/盈亏比及用户画线。只使用本次上下文，不声称拿到了未提供的实时行情，不编造价格、指标或消息。先区分本地程序计算结果与自己的判断；若数据不足、K线不完整或上下文矛盾，明确说明。分析震荡区间时区分下沿、上沿和区间中部：边缘确认后才讨论反弹/回落计划，中部原则上观望；止损应在失效边界之外，止盈优先看区间另一侧，并核对参考盈亏比，空间不足时提示观望。输出简洁、可核对的中文小节：市场状态与依据、计划方向/入场条件、参考止损、参考止盈、参考盈亏比、失效条件与不确定性；没有可用方向时明确写观望。所有价位仅供参考，不保证收益，不替用户下单，也不把建议写成确定预测。只输出自然中文纯文本，使用简短小标题和段落；不要使用 Markdown 格式、星号、井号、反引号、项目符号或代码围栏。' },
+        { role: 'user', content: `当前上下文：${JSON.stringify(context)}\n\n问题：${question}` },
+      ],
+      temperature: 0.4,
+      max_tokens: aiMaxTokens,
+    }
+    let response = await fetch(aiChatUrl, {
       method: 'POST',
       headers,
       signal: AbortSignal.timeout(aiTimeoutMs),
-      body: JSON.stringify({
-        model: aiModel,
-        messages: [
-          { role: 'system', content: '你是 KEEL 个人交易工作台里的中文市场分析助手，服务于 Binance USDⓈ-M Futures 图表。用户主动调用你做复核和解释；本地程序已提供交易对、周期、价格、近期K线、支撑阻力、市场环境、参考入场/止盈/止损/盈亏比及用户画线。只使用本次上下文，不声称拿到了未提供的实时行情，不编造价格、指标或消息。先区分本地程序计算结果与自己的判断；若数据不足、K线不完整或上下文矛盾，明确说明。分析震荡区间时区分下沿、上沿和区间中部：边缘确认后才讨论反弹/回落计划，中部原则上观望；止损应在失效边界之外，止盈优先看区间另一侧，并核对参考盈亏比，空间不足时提示观望。输出简洁、可核对的中文小节：市场状态与依据、计划方向/入场条件、参考止损、参考止盈、参考盈亏比、失效条件与不确定性；没有可用方向时明确写观望。所有价位仅供参考，不保证收益，不替用户下单，也不把建议写成确定预测。只输出自然中文纯文本，使用简短小标题和段落；不要使用 Markdown 格式、星号、井号、反引号、项目符号或代码围栏。' },
-          { role: 'user', content: `当前上下文：${JSON.stringify(context)}\n\n问题：${question}` },
-        ],
-        temperature: 0.4,
-      }),
+      body: JSON.stringify(requestBody),
     })
-    const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } }
+    let payload = await response.json() as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } }
+    // Newer OpenAI-compatible gateways renamed max_tokens. Retry only for that
+    // specific validation error so ordinary provider errors are not duplicated.
+    if (!response.ok && response.status === 400 && /max[_ ]tokens|unsupported parameter/i.test(payload.error?.message ?? '')) {
+      const compatibilityBody = { ...requestBody, max_tokens: undefined, max_completion_tokens: aiMaxTokens }
+      response = await fetch(aiChatUrl, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(aiTimeoutMs),
+        body: JSON.stringify(compatibilityBody),
+      })
+      payload = await response.json() as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } }
+    }
     if (!response.ok) return reply.code(502).send({ error: payload.error?.message ?? 'AI 服务请求失败' })
     return { answer: payload.choices?.[0]?.message?.content ?? '' }
   } catch (error) {

@@ -121,7 +121,7 @@ export function validateBinanceOrder(input: BinanceOrderInput): string | null {
 
   if (input.type === 'TRAILING_STOP_MARKET') {
     const callbackRate = Number(input.callbackRate)
-    if (!Number.isFinite(callbackRate) || callbackRate < 0.1 || callbackRate > 5) return '追踪回调率须在 0.1% 至 5% 之间'
+    if (!Number.isFinite(callbackRate) || callbackRate < 0.1 || callbackRate > 20) return '追踪回调率须在 0.1% 至 20% 之间'
     if (input.activationPrice !== undefined && input.activationPrice !== '') {
       const activationPrice = Number(input.activationPrice)
       if (!Number.isFinite(activationPrice) || activationPrice <= 0) return '激活价格必须是大于 0 的数字'

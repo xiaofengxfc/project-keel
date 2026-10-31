@@ -113,7 +113,7 @@
 .trade-panel>.tabs{flex:none}
 .trade-panel>.ai-content{height:auto;min-height:580px;flex:1;min-height:0}
 .ai-content .ai-intro,.ai-content .quick-prompts,.ai-content .ai-input,.ai-content .ai-disclaimer{flex:none}
-.ai-content .messages{min-height:0;white-space:pre-wrap}.message{white-space:pre-wrap;line-height:1.75}
+.ai-content .messages{min-height:0;white-space:pre-wrap}.message{white-space:pre-wrap;line-height:1.75;max-width:100%;overflow-wrap:anywhere}
 .ai-input textarea{min-height:34px;max-height:150px;overflow:auto}
 .position-modal-backdrop{background:rgba(20,30,40,.42)}
 .position-modal{background:#fff;border:1px solid #e7ebf0;color:#18212f;box-shadow:0 24px 80px rgba(23,36,51,.22)}
@@ -139,6 +139,10 @@
 .order-content .risk-row.manual input{display:block;appearance:none;background:#fff;border:1px solid #dfe5ea;border-radius:6px;color:#243142;box-shadow:inset 0 1px 2px #1724330a;outline:none;}
 .order-content .risk-row.manual input:focus{border-color:#1b9a72;box-shadow:0 0 0 2px #1b9a7222;}
 .order-content .risk-row.manual input::placeholder{color:#a6afb8}
+
+/* Keep panels scrollable while hiding the decorative vertical scrollbars. */
+html,body,#root,.analysis-modal,.indicator-panel,.order-content,.messages{scrollbar-width:none;-ms-overflow-style:none}
+html::-webkit-scrollbar,body::-webkit-scrollbar,#root::-webkit-scrollbar,.analysis-modal::-webkit-scrollbar,.indicator-panel::-webkit-scrollbar,.order-content::-webkit-scrollbar,.messages::-webkit-scrollbar{width:0;height:0}
 .leverage-input{margin-top:6px}
 .leverage-input input{min-width:0}
 .leverage-retry{border:0;background:transparent;color:#168b63;font-size:10px;padding:3px 0;cursor:pointer}
