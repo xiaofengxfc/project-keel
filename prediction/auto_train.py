@@ -19,6 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .training_progress import report_progress
+
 
 def metric(metadata: dict, name: str, default: float) -> float:
     value = metadata.get("metrics", {}).get(name, default)
@@ -71,9 +73,16 @@ def candidate_status(candidate: dict, current: dict | None, min_test_samples: in
     return "无法在同一未来测试集比较 incumbent；请等待前向验证数据后晋级"
 
 
-def run_module(module: str, args: list[str]) -> None:
+def run_module(module: str, args: list[str], extra_env: dict[str, str] | None = None) -> None:
     command = [sys.executable, "-m", module, *args]
-    subprocess.run(command, check=True)
+    environment = os.environ.copy()
+    if extra_env:
+        environment.update(extra_env)
+    try:
+        subprocess.run(command, check=True, env=environment)
+    except subprocess.CalledProcessError as error:
+        report_progress("failed", error=f"{module} 子进程退出，代码 {error.returncode}", failedModule=module, message=f"{module} 执行失败")
+        raise
 
 
 def main() -> None:
@@ -88,6 +97,8 @@ def main() -> None:
     symbols = sorted({item.strip().upper() for item in args.symbols.split(",") if item.strip()})
     if len(symbols) < 2:
         parser.error("通用模型至少需要两个交易对")
+    if args.start_time < 0:
+        parser.error("start-time 必须为非负 Unix 毫秒时间")
     args.data_dir.mkdir(parents=True, exist_ok=True)
     args.model_root.mkdir(parents=True, exist_ok=True)
     target = args.model_root / args.interval
@@ -95,13 +106,14 @@ def main() -> None:
     if backup.exists() and not target.exists():
         backup.rename(target)
     input_paths: list[str] = []
-    for symbol in symbols:
+    for index, symbol in enumerate(symbols, start=1):
         output_path = args.data_dir / f"{symbol}-{args.interval}.csv"
+        report_progress("collecting", interval=args.interval, currentSymbol=symbol, symbolIndex=index, symbolCount=len(symbols), pagesFetched=0, rowsFetched=0, message=f"正在检查并更新 {symbol} 历史 K 线")
         run_module("prediction.collect_klines", [
             "--symbol", symbol, "--interval", args.interval,
             "--start-time", str(args.start_time),
             "--output", str(output_path),
-        ])
+        ], {"PREDICTION_TRAINING_SYMBOL_INDEX": str(index), "PREDICTION_TRAINING_SYMBOL_COUNT": str(len(symbols))})
         input_paths.append(str(output_path))
 
     with tempfile.TemporaryDirectory(prefix="keel-model-") as temporary:
@@ -111,9 +123,11 @@ def main() -> None:
             "--horizon-bars", os.getenv("PREDICTION_HORIZON_BARS", "3"),
             "--output-dir", str(candidate),
         ]
+        report_progress("training", interval=args.interval, currentSymbol=None, symbolIndex=len(symbols), symbolCount=len(symbols), message="K 线采集完成，开始训练候选模型")
         if (target / "direction.txt").is_file() and (target / "metadata.json").is_file():
             train_args.extend(["--baseline-model-dir", str(target)])
         run_module("prediction.train", train_args)
+        report_progress("validating", interval=args.interval, currentSymbol=None, symbolIndex=len(symbols), symbolCount=len(symbols), message="训练完成，正在检查样本与评估指标")
         metadata = json.loads((candidate / "metadata.json").read_text(encoding="utf-8"))
         current_metadata_path = target / "metadata.json"
         current = None
@@ -121,9 +135,12 @@ def main() -> None:
             current = json.loads(current_metadata_path.read_text(encoding="utf-8"))
         status = candidate_status(metadata, current, args.min_test_samples)
         if status:
-            raise SystemExit(status)
+            report_progress("not-promoted", interval=args.interval, error=status, message="候选模型已训练，但未通过晋级比较；现有模型保持不变")
+            print(f"NOT_PROMOTED: {status}", file=sys.stderr, flush=True)
+            raise SystemExit(3)
         accuracy = metric(metadata, "accuracy", 0.0)
         brier = metric(metadata, "brier", float("inf"))
+        report_progress("promoting", interval=args.interval, metrics=metadata.get("metrics", {}), error=None, message="候选模型通过检查，正在安全替换当前模型")
         # Prepare the complete candidate beside the live model first.  Moving
         # directories is atomic on the same volume, so a failed promotion can
         # restore the previous model instead of leaving the service without a
@@ -147,6 +164,7 @@ def main() -> None:
         finally:
             if staged.exists():
                 shutil.rmtree(staged, ignore_errors=True)
+        report_progress("completed", interval=args.interval, metrics=metadata.get("metrics", {}), error=None, message=f"{args.interval} 模型已晋级并保存")
         print(f"promoted global {args.interval} model: accuracy={accuracy:.4f}, brier={brier:.4f}")
 
 

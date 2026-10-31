@@ -1,9 +1,9 @@
 import crypto from 'node:crypto'
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import 'dotenv/config'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
@@ -206,20 +206,75 @@ app.get('/api/market/symbols', async (_request, reply) => {
 type PredictionCandleInput = { time?: number; open?: number; high?: number; low?: number; close?: number; volume?: number }
 type PredictionRequestBody = { symbol?: string; interval?: string; candles?: PredictionCandleInput[]; horizonBars?: number }
 type PredictionTrainingMetrics = { accuracy?: number; brier?: number; testSamples?: number }
+type PredictionTrainingIntervalResult = {
+  phase: 'pending' | 'running' | 'completed' | 'not-promoted' | 'failed'
+  error?: string | null
+  metrics?: PredictionTrainingMetrics
+  finishedAt?: number
+}
 type PredictionTrainingJob = {
+  jobId: string | null
   running: boolean
-  phase: 'idle' | 'running' | 'completed' | 'failed'
+  phase: 'idle' | 'running' | 'partial' | 'completed' | 'not-promoted' | 'failed'
+  stage?: string
   output: string
   error: string | null
   startedAt: number | null
   finishedAt: number | null
+  intervals?: string[]
+  currentInterval?: string
+  completedIntervals?: string[]
+  finishedIntervals?: string[]
+  intervalResults?: Record<string, PredictionTrainingIntervalResult>
+  currentSymbol?: string
+  symbolIndex?: number
+  symbolCount?: number
+  pagesFetched?: number
+  rowsFetched?: number
+  intervalIndex?: number
+  workerPid?: number
   interval?: string
   symbols?: string[]
   metrics?: PredictionTrainingMetrics
 }
-let predictionTrainingJob: PredictionTrainingJob = { running: false, phase: 'idle', output: '', error: null, startedAt: null, finishedAt: null }
+const trainingStatePath = resolve(process.env.PREDICTION_TRAINING_STATE_FILE ?? 'prediction/validation/training-state.json')
+const trainingLogPath = resolve(process.env.PREDICTION_TRAINING_LOG_FILE ?? 'prediction/validation/training.log')
+let predictionTrainingJob: PredictionTrainingJob = { jobId: null, running: false, phase: 'idle', output: '', error: null, startedAt: null, finishedAt: null }
 let predictionTrainingProcess: ChildProcess | null = null
 let predictionTrainingStartInFlight = false
+
+async function persistPredictionTrainingJob(job: PredictionTrainingJob) {
+  await mkdir(dirname(trainingStatePath), { recursive: true })
+  const temporaryPath = `${trainingStatePath}.${process.pid}.tmp`
+  await writeFile(temporaryPath, JSON.stringify(job), 'utf8')
+  await rename(temporaryPath, trainingStatePath)
+  predictionTrainingJob = job
+}
+
+async function readPredictionTrainingJob(): Promise<PredictionTrainingJob> {
+  try {
+    const value = JSON.parse(await readFile(trainingStatePath, 'utf8')) as PredictionTrainingJob
+    if (!value || typeof value !== 'object' || typeof value.running !== 'boolean' || !['idle', 'running', 'partial', 'completed', 'not-promoted', 'failed'].includes(value.phase)) throw new Error('训练状态文件格式无效')
+    if (value.running && predictionTrainingProcess === null) {
+      let alive = false
+      if (value.workerPid && Number.isInteger(value.workerPid)) {
+        try { process.kill(value.workerPid, 0); alive = true } catch { alive = false }
+      } else if (value.startedAt && Date.now() - value.startedAt < 30_000) {
+        alive = true
+      }
+      if (!alive) {
+        const recovered = { ...value, running: false, phase: 'failed' as const, stage: 'interrupted', error: '后端重启期间训练工作进程已退出；请查看已保存日志后重新启动。', finishedAt: Date.now() }
+        await persistPredictionTrainingJob(recovered)
+        return recovered
+      }
+    }
+    try { value.output = (await readFile(trainingLogPath, 'utf8')).slice(-12_000) } catch { value.output = '' }
+    predictionTrainingJob = value
+    return value
+  } catch {
+    return predictionTrainingJob
+  }
+}
 
 app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, reply) => {
   if (!predictionEnabled) return reply.code(503).send({ error: '本地预测模型已被配置关闭，请设置 PREDICTION_ENABLED=true 后重启后端。' })
@@ -271,7 +326,7 @@ app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, rep
   }
 })
 
-app.get('/api/prediction/train/status', async () => predictionTrainingJob)
+app.get('/api/prediction/train/status', async () => readPredictionTrainingJob())
 
 app.get<{ Querystring: { symbol?: string; interval?: string; horizonBars?: string } }>('/api/prediction/validation/metrics', async (request, reply) => {
   const { symbol, interval, horizonBars } = request.query
@@ -301,10 +356,13 @@ app.get<{ Querystring: { symbol?: string; interval?: string; horizonBars?: strin
   }
 })
 
-app.post<{ Body: { interval?: string; symbolCount?: number; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
-  if (predictionTrainingJob.running || predictionTrainingStartInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。' })
-  const interval = request.body?.interval
-  if (!interval || !['15m', '1h', '4h', '1d'].includes(interval)) return reply.code(400).send({ error: '请选择有效周期：15m、1h、4h 或 1d。' })
+app.post<{ Body: { interval?: string; intervals?: string[]; symbolCount?: number; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
+  const currentJob = await readPredictionTrainingJob()
+  if (currentJob.running || predictionTrainingStartInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。', jobId: currentJob.jobId })
+  const intervalInput = request.body?.intervals ?? (request.body?.interval ? [request.body.interval] : [])
+  if (!Array.isArray(intervalInput) || intervalInput.length < 1 || intervalInput.length > 4) return reply.code(400).send({ error: '请选择 1 到 4 个训练周期。' })
+  const intervals = [...new Set(intervalInput.map((value) => String(value).trim()))]
+  if (!intervals.length || intervals.some((value) => !['15m', '1h', '4h', '1d'].includes(value))) return reply.code(400).send({ error: '请选择有效周期：15m、1h、4h 或 1d。' })
   const symbolCount = Number(request.body?.symbolCount)
   if (!Number.isInteger(symbolCount) || symbolCount < 2 || symbolCount > 30) return reply.code(400).send({ error: '币种数量必须是 2 到 30 之间的整数。' })
   if (request.body?.symbols !== undefined && !Array.isArray(request.body.symbols)) return reply.code(400).send({ error: '手动币种列表格式无效。' })
@@ -339,66 +397,80 @@ app.post<{ Body: { interval?: string; symbolCount?: number; symbols?: string[] }
   } finally {
     predictionTrainingStartInFlight = false
   }
+  // Keep the start lock through durable state creation and worker spawn so a
+  // concurrent request cannot slip into the small async gap above.
+  predictionTrainingStartInFlight = true
   const pythonPath = process.env.PREDICTION_PYTHON
     ?? (existsSync(resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'))
       ? resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
       : 'python')
-  predictionTrainingJob = { running: true, phase: 'running', output: `训练币种：${symbols.join(', ')}\n正在采集历史 K 线…`, error: null, startedAt: Date.now(), finishedAt: null, interval, symbols }
+  const jobId = crypto.randomUUID()
+  const progressPath = resolve(dirname(trainingStatePath), 'training-progress.json')
+  const initialJob: PredictionTrainingJob = {
+    jobId,
+    running: true,
+    phase: 'running',
+    stage: 'starting',
+    output: '',
+    error: null,
+    startedAt: Date.now(),
+    finishedAt: null,
+    intervals,
+    interval: intervals.length === 1 ? intervals[0] : undefined,
+    currentInterval: intervals[0],
+    completedIntervals: [],
+    finishedIntervals: [],
+    intervalResults: Object.fromEntries(intervals.map((value) => [value, { phase: 'pending' }])),
+    symbols,
+    symbolCount: symbols.length,
+    symbolIndex: 0,
+    pagesFetched: 0,
+    rowsFetched: 0,
+  }
   try {
-    const child = spawn(pythonPath, ['-m', 'prediction.auto_train', '--symbols', symbols.join(','), '--interval', interval], {
+    await mkdir(dirname(trainingStatePath), { recursive: true })
+    await writeFile(trainingLogPath, `任务 ${jobId} 已创建\n币种：${symbols.join(', ')}\n周期：${intervals.join(', ')}\n`, 'utf8')
+    await writeFile(progressPath, JSON.stringify({ jobId, phase: 'starting', interval: intervals[0] }), 'utf8')
+    await persistPredictionTrainingJob(initialJob)
+    const child = spawn(pythonPath, [
+      '-u', '-m', 'prediction.training_worker',
+      '--job-id', jobId,
+      '--intervals', intervals.join(','),
+      '--symbols', symbols.join(','),
+      '--state-file', trainingStatePath,
+      '--progress-file', progressPath,
+      '--log-file', trainingLogPath,
+    ], {
       cwd: process.cwd(),
       windowsHide: true,
-      env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+      env: { ...process.env, PREDICTION_TRAINING_PROGRESS_FILE: progressPath },
+      stdio: 'ignore',
     })
     predictionTrainingProcess = child
-    const appendOutput = (chunk: Buffer | string) => {
-      predictionTrainingJob.output = `${predictionTrainingJob.output}${chunk.toString()}`.slice(-12_000)
-    }
-    child.stdout?.on('data', appendOutput)
-    child.stderr?.on('data', appendOutput)
     child.on('error', (error) => {
-      predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: error.message, finishedAt: Date.now() }
-      predictionTrainingProcess = null
+      void (async () => {
+        const latest = await readPredictionTrainingJob()
+        if (latest.jobId !== jobId) return
+        const failed = { ...latest, running: false, phase: 'failed' as const, stage: 'worker-start-failed', error: `无法启动训练工作进程：${error.message}`, finishedAt: Date.now() }
+        await persistPredictionTrainingJob(failed)
+        await writeFile(trainingLogPath, `${failed.error}\n`, { flag: 'a' })
+        predictionTrainingProcess = null
+      })()
     })
-    child.on('close', async (code) => {
-      if (predictionTrainingProcess !== child) return
-      predictionTrainingProcess = null
-      if (code !== 0) {
-        predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: `训练进程退出，代码 ${code ?? '未知'}`, finishedAt: Date.now() }
-        return
-      }
-      try {
-        const modelRoot = resolve(process.env.PREDICTION_MODEL_DIR ?? 'prediction/models')
-        const metadata = JSON.parse(await readFile(resolve(modelRoot, interval, 'metadata.json'), 'utf8')) as { symbol?: string; interval?: string; metrics?: PredictionTrainingMetrics }
-        if (metadata.symbol !== '*' || metadata.interval !== interval) throw new Error('训练产物不是预期的通用周期模型')
-        let reloadNotice = ''
-        try {
-          const predictionUrl = new URL(predictionServiceUrl)
-          if (['127.0.0.1', 'localhost', '[::1]'].includes(predictionUrl.hostname)) {
-            const reloadUrl = new URL('/reload', predictionUrl)
-            const response = await fetch(reloadUrl, { method: 'POST', signal: AbortSignal.timeout(5000) })
-            if (!response.ok) reloadNotice = '模型已保存；本地推理服务未能热加载，请重启预测服务。'
-          }
-        } catch { reloadNotice = '模型已保存；本地推理服务未能热加载，请重启预测服务。' }
-        predictionTrainingJob = {
-          ...predictionTrainingJob,
-          running: false,
-          phase: 'completed',
-          metrics: metadata.metrics,
-          error: reloadNotice || null,
-          finishedAt: Date.now(),
-          output: `${predictionTrainingJob.output}${reloadNotice ? `\n${reloadNotice}` : ''}`.slice(-12_000),
-        }
-      } catch (error) {
-        predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: error instanceof Error ? error.message : '读取训练结果失败', finishedAt: Date.now() }
-      }
+    child.once('close', () => {
+      if (predictionTrainingProcess === child) predictionTrainingProcess = null
     })
-    return reply.code(202).send(predictionTrainingJob)
+    child.unref()
+    predictionTrainingStartInFlight = false
+    return reply.code(202).send(await readPredictionTrainingJob())
   } catch (error) {
+    predictionTrainingStartInFlight = false
     predictionTrainingProcess = null
-    predictionTrainingJob = { ...predictionTrainingJob, running: false, phase: 'failed', error: error instanceof Error ? error.message : '无法启动模型训练', finishedAt: Date.now() }
-    return reply.code(503).send({ error: predictionTrainingJob.error })
+    const message = error instanceof Error ? error.message : '无法启动模型训练'
+    const failed = { ...initialJob, running: false, phase: 'failed' as const, stage: 'worker-start-failed', error: message, finishedAt: Date.now() }
+    await persistPredictionTrainingJob(failed)
+    return reply.code(503).send({ error: message, jobId })
   }
 })
 

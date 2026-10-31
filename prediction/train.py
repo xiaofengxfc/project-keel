@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .features import FEATURE_NAMES, Candle, build_training_rows, drop_open_candle, normalize_candles
+from .training_progress import report_progress
 
 
 def read_csv(path: Path) -> list[Candle]:
@@ -193,6 +194,7 @@ def main() -> None:
     returns = [row[4] for row in training_rows]
     if len(features) < 120:
         parser.error(f"有效训练样本只有 {len(features)} 条，至少需要 120 条")
+    report_progress("training", interval=args.interval, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message=f"已准备 {len(features)} 条训练样本，开始拟合模型")
     try:
         import numpy as np
         import lightgbm as lgb
@@ -236,6 +238,7 @@ def main() -> None:
     probabilities = apply_temperature(model.predict_proba(x_test).tolist(), temperature)
     metrics = classification_metrics(probabilities, y_test.tolist())
     brier = brier_score(probabilities, y_test.tolist()) if len(y_test) else 0.0
+    report_progress("validating", interval=args.interval, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message="测试集评估与 incumbent 对比准备完成")
     baseline_comparison: dict[str, Any] = {"compatible": False, "reason": "没有提供 incumbent 模型"}
     if args.baseline_model_dir:
         baseline_metadata_path = args.baseline_model_dir / "metadata.json"
@@ -260,6 +263,7 @@ def main() -> None:
                 baseline_comparison = {"compatible": False, "reason": "incumbent 特征 schema 与本地特征不兼容"}
         else:
             baseline_comparison = {"compatible": False, "reason": "incumbent native model or metadata is missing"}
+    report_progress("exporting", interval=args.interval, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message="正在导出 LightGBM 和 ONNX 模型")
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     native_path = output_dir / "direction.txt"

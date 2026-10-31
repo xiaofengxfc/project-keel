@@ -71,6 +71,10 @@ python -m prediction.auto_train --symbols BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT --inte
 
 重训练完成后重启本地推理服务，使其加载新模型。不要把自动重训练直接连接到下单逻辑。
 
+侧边栏的“模型训练”页面可同时选择多个周期。后端会在一个持久任务中逐周期训练，各周期独立验证、晋级并保存在 `prediction/models/<周期>/`；刷新页面会重新读取任务状态。任务状态和最近日志默认保存在 `prediction/validation/training-state.json` 与 `training.log`，可用 `PREDICTION_TRAINING_STATE_FILE`、`PREDICTION_TRAINING_LOG_FILE` 更改位置。各周期结果相互独立，单个周期失败不会撤销其他已完成周期。
+
+采集会复用 `data/<币种>-<周期>.csv`，先补最新 K 线，再补全已有历史缺口；每页成功后原子写入检查点，便于失败后续跑。Binance 限流、服务器错误和网络超时会进行退避重试，次数可由 `PREDICTION_COLLECT_RETRIES` 配置。训练页面会显示当前周期、币种、采集阶段和周期结果。关闭浏览器不影响后端 worker；若 worker 在后端重启期间已退出，状态会标记为中断并保留日志。
+
 ## 前向验证记录
 
 推理服务会把每次预测的方向概率和必要的结算信息保存在本机 SQLite 数据库中，后续收到目标 K 线后计算真实类别、命中率和 Brier 分数。数据库默认位于 `prediction/validation/predictions.sqlite3`，默认保留 90 天；只保存预测结果及用于结算的收盘价，不保存原始 K 线。该目录已加入 `.gitignore`，不会随源码提交。
