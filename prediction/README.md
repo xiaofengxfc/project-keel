@@ -59,3 +59,13 @@ POST /predict
 
 模型结果只展示方向概率并交给 AI 解释层说明，模型不会直接驱动下单。上线前应记录后续真实结果，持续观察命中率、覆盖率和 Brier 分数。
 
+## 自动重训练
+
+可以把下面的一次性命令交给 Windows 任务计划程序或其他调度器定期执行。它会采集多个交易对、训练候选通用模型，并且只有候选模型同时不劣于当前模型时才替换；旧模型保存在 `prediction/models/1h.previous`。
+
+```powershell
+python -m prediction.auto_train --symbols BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT --interval 1h
+```
+
+重训练完成后重启本地推理服务，使其加载新模型。不要把自动重训练直接连接到下单逻辑。
+

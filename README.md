@@ -80,6 +80,8 @@ $env:PREDICTION_MODEL_DIR = "prediction\models"
 python -m prediction.service
 ```
 
+通用模型可以由 `prediction.auto_train` 定期重训练。它会合并多个交易对的数据，只在候选模型通过指标门槛且不劣于当前模型时替换，并保留上一版本回滚。
+
 再在 `.env` 中启用后端代理：
 
 ```env
