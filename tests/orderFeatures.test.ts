@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { floorToStep, isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.ts'
 import { calculateTechnicalIndicators } from '../src/technicalIndicators.ts'
+import { replaceProtectionOrderSet, type ProtectionOrderSnapshot, type ProtectionOrderValue } from '../src/protectionOrders.ts'
 
 test('floorToStep preserves integer trailing zeroes and aligns decimals', () => {
   assert.equal(floorToStep(109.9, '1'), '109')
@@ -42,6 +43,53 @@ test('conditional and trailing orders require valid trigger settings', () => {
   assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', quantity: '1', reduceOnly: true, positionSide: 'LONG', stopPrice: '62000' }) ?? '', /双向持仓/)
   assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'TRAILING_STOP_MARKET', quantity: '1', callbackRate: '6' }) ?? '', /回调率/)
   assert.equal(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'TRAILING_STOP_MARKET', quantity: '1', callbackRate: '0.5' }), null)
+})
+
+test('protection replacement cancels the full pair before recreating changed and unchanged values', async () => {
+  const previous: ProtectionOrderSnapshot<{ id: number }>[] = [
+    { order: { id: 1 }, value: { kind: 'STOP_MARKET', triggerPrice: '90', workingType: 'MARK_PRICE' } },
+    { order: { id: 2 }, value: { kind: 'TAKE_PROFIT_MARKET', triggerPrice: '120', workingType: 'CONTRACT_PRICE' } },
+  ]
+  const replacements: ProtectionOrderValue[] = [
+    { kind: 'STOP_MARKET', triggerPrice: '95', workingType: 'CONTRACT_PRICE' },
+    previous[1].value,
+  ]
+  const calls: string[] = []
+  const result = await replaceProtectionOrderSet({
+    previous,
+    replacements,
+    cancel: async ({ id }) => { calls.push(`cancel:${id}`) },
+    place: async ({ kind, triggerPrice }) => { calls.push(`place:${kind}:${triggerPrice}`); return { id: triggerPrice } },
+    remove: async ({ id }) => { calls.push(`remove:${id}`) },
+    restore: async ({ kind, triggerPrice }) => { calls.push(`restore:${kind}:${triggerPrice}`) },
+  })
+  assert.deepEqual(calls, ['cancel:1', 'cancel:2', 'place:STOP_MARKET:95', 'place:TAKE_PROFIT_MARKET:120'])
+  assert.equal(result.canceled, 2)
+  assert.deepEqual(result.placed, [{ id: '95' }, { id: '120' }])
+})
+
+test('protection replacement restores the original pair if a replacement fails', async () => {
+  const previous: ProtectionOrderSnapshot<{ id: number }>[] = [
+    { order: { id: 1 }, value: { kind: 'STOP_MARKET', triggerPrice: '90', workingType: 'CONTRACT_PRICE' } },
+    { order: { id: 2 }, value: { kind: 'TAKE_PROFIT_MARKET', triggerPrice: '120', workingType: 'CONTRACT_PRICE' } },
+  ]
+  const calls: string[] = []
+  await assert.rejects(() => replaceProtectionOrderSet({
+    previous,
+    replacements: [
+      { kind: 'STOP_MARKET', triggerPrice: '95', workingType: 'CONTRACT_PRICE' },
+      { kind: 'TAKE_PROFIT_MARKET', triggerPrice: '125', workingType: 'CONTRACT_PRICE' },
+    ],
+    cancel: async ({ id }) => { calls.push(`cancel:${id}`) },
+    place: async ({ kind, triggerPrice }) => {
+      calls.push(`place:${kind}:${triggerPrice}`)
+      if (triggerPrice === '125') throw new Error('exchange rejected')
+      return { id: '95' }
+    },
+    remove: async ({ id }) => { calls.push(`remove:${id}`) },
+    restore: async ({ kind, triggerPrice }) => { calls.push(`restore:${kind}:${triggerPrice}`) },
+  }), /已尝试恢复原保护单：exchange rejected/)
+  assert.deepEqual(calls, ['cancel:1', 'cancel:2', 'place:STOP_MARKET:95', 'place:TAKE_PROFIT_MARKET:125', 'remove:95', 'restore:STOP_MARKET:90', 'restore:TAKE_PROFIT_MARKET:120'])
 })
 
 test('Binance precision alignment uses decimal strings without floating point drift', () => {

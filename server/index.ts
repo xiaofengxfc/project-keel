@@ -6,6 +6,7 @@ import cors from '@fastify/cors'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
 import { isMarketExecution, isStepAligned, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
 import { maximumLeverageForBrackets, protectionOrderDirection } from '../src/binanceTrading.js'
+import { replaceProtectionOrderSet, type ProtectionOrderKind, type ProtectionOrderSnapshot, type ProtectionOrderValue } from '../src/protectionOrders.js'
 import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
 
 const app = Fastify({ logger: true })
@@ -358,40 +359,54 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
       if (priceFilter?.maxPrice && Number(priceFilter.maxPrice) > 0 && price > Number(priceFilter.maxPrice)) return reply.code(400).send({ error: `价格超过 Binance 最大值 (${priceFilter.maxPrice})` })
       if (priceFilter?.tickSize && Number(priceFilter.tickSize) > 0 && !isStepAligned(value, priceFilter.tickSize)) return reply.code(400).send({ error: `价格必须符合 Binance 最小变动单位 (${priceFilter.tickSize})` })
     }
-    const markPrice = Number(position?.markPrice ?? (await binanceRequest<{ markPrice: string }>('GET', '/fapi/v1/premiumIndex', { symbol })).markPrice)
-    if (stopLoss && (isLong ? Number(stopLoss) >= markPrice : Number(stopLoss) <= markPrice)) return reply.code(400).send({ error: isLong ? '多仓止损价必须低于标记价格' : '空仓止损价必须高于标记价格' })
-    if (takeProfit && (isLong ? Number(takeProfit) <= markPrice : Number(takeProfit) >= markPrice)) return reply.code(400).send({ error: isLong ? '多仓止盈价必须高于标记价格' : '空仓止盈价必须低于标记价格' })
+    const referencePrice = workingType === 'MARK_PRICE'
+      ? Number(position?.markPrice ?? (await binanceRequest<{ markPrice: string }>('GET', '/fapi/v1/premiumIndex', { symbol })).markPrice)
+      : Number((await binanceRequest<{ price: string }>('GET', '/fapi/v1/ticker/price', { symbol })).price)
+    if (!Number.isFinite(referencePrice) || referencePrice <= 0) return reply.code(502).send({ error: '无法读取当前触发参考价格，请稍后重试' })
+    if (stopLoss && (isLong ? Number(stopLoss) >= referencePrice : Number(stopLoss) <= referencePrice)) return reply.code(400).send({ error: isLong ? `多仓止损价必须低于${workingType === 'MARK_PRICE' ? '标记' : '最新'}价格 (${referencePrice})` : `空仓止损价必须高于${workingType === 'MARK_PRICE' ? '标记' : '最新'}价格 (${referencePrice})` })
+    if (takeProfit && (isLong ? Number(takeProfit) <= referencePrice : Number(takeProfit) >= referencePrice)) return reply.code(400).send({ error: isLong ? `多仓止盈价必须高于${workingType === 'MARK_PRICE' ? '标记' : '最新'}价格 (${referencePrice})` : `空仓止盈价必须低于${workingType === 'MARK_PRICE' ? '标记' : '最新'}价格 (${referencePrice})` })
     const [standardOrders, algoOrders] = await Promise.all([
       binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true),
       binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true).catch(() => []),
     ])
-    const existingOrders = [...standardOrders, ...algoOrders.map((order) => ({ ...order, orderId: order.algoId, type: order.orderType ?? order.type, stopPrice: order.triggerPrice ?? order.stopPrice, isAlgoOrder: true }))] as Array<{ orderId: number; symbol: string; type: string; side: string; positionSide?: string; closePosition?: boolean | string; isAlgoOrder?: boolean }>
+    const existingOrders = [...standardOrders, ...algoOrders.map((order) => ({ ...order, orderId: order.algoId, type: order.orderType ?? order.type, stopPrice: order.triggerPrice ?? order.stopPrice, isAlgoOrder: true }))] as Array<{ orderId: number; symbol: string; type: string; side: string; positionSide?: string; closePosition?: boolean | string; stopPrice?: string | number; workingType?: string; isAlgoOrder?: boolean }>
     const protectSide = side
     const matchingProtectionOrders = existingOrders.filter((order) => order.symbol === symbol && order.side === protectSide && ['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(order.type) && (order.closePosition === true || order.closePosition === 'true') && (order.positionSide ?? 'BOTH') === positionSide)
-    const oldOrdersToCancel = matchingProtectionOrders.filter((order) => order.type === 'STOP_MARKET' ? stopLossProvided : takeProfitProvided)
-    // Binance rejects a second closePosition conditional order in the same direction
-    // (error -4130), so remove the replaced orders before creating their replacements.
-    try {
-      for (const order of oldOrdersToCancel) await binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true)
-    } catch (error) {
-      throw new Error(`撤销旧保护单失败：${error instanceof Error ? error.message : '未知错误'}`)
-    }
-    const placed: Array<{ orderId: number }> = []
-    try {
-      for (const [kind, stopPrice, shouldUpdate] of [['STOP_MARKET', stopLoss, stopLossProvided], ['TAKE_PROFIT_MARKET', takeProfit, takeProfitProvided]] as const) {
-        if (!shouldUpdate || !stopPrice) continue
-        const algoParams: Record<string, QueryValue> = {
-          algoType: 'CONDITIONAL', symbol, side, type: kind, triggerPrice: stopPrice,
-          closePosition: true, workingType,
-        }
-        if (positionSide === 'LONG' || positionSide === 'SHORT') algoParams.positionSide = positionSide
-        placed.push(await binanceRequest<{ algoId: number }>('POST', '/fapi/v1/algoOrder', algoParams, true).then((result) => ({ orderId: result.algoId })))
+    const snapshotProtectionOrder = (order: (typeof matchingProtectionOrders)[number]): ProtectionOrderSnapshot<typeof order> => {
+      if (order.type !== 'STOP_MARKET' && order.type !== 'TAKE_PROFIT_MARKET') throw new Error('保护单类型无效')
+      if (order.stopPrice === undefined || !Number.isFinite(Number(order.stopPrice)) || Number(order.stopPrice) <= 0) throw new Error('读取到缺少有效触发价格的旧保护单，已停止更新')
+      return {
+        order,
+        value: {
+          kind: order.type as ProtectionOrderKind,
+          triggerPrice: String(order.stopPrice),
+          workingType: order.workingType === 'MARK_PRICE' ? 'MARK_PRICE' : 'CONTRACT_PRICE',
+        },
       }
-    } catch (error) {
-      await Promise.allSettled(placed.map((order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true)))
-      throw new Error(`创建新保护单失败，旧保护单已撤销：${error instanceof Error ? error.message : '未知错误'}`)
     }
-    return { orders: placed, canceled: oldOrdersToCancel.length }
+    const previous = matchingProtectionOrders.map(snapshotProtectionOrder)
+    const previousStop = previous.find(({ value }) => value.kind === 'STOP_MARKET')?.value
+    const previousTarget = previous.find(({ value }) => value.kind === 'TAKE_PROFIT_MARKET')?.value
+    const replacementValues: Array<ProtectionOrderValue | undefined> = [
+      stopLossProvided ? stopLoss ? { kind: 'STOP_MARKET', triggerPrice: stopLoss, workingType } : undefined : previousStop,
+      takeProfitProvided ? takeProfit ? { kind: 'TAKE_PROFIT_MARKET', triggerPrice: takeProfit, workingType } : undefined : previousTarget,
+    ]
+    // Binance rejects another closePosition conditional order while any order in
+    // the same direction is open (-4130). Replace the complete protection set.
+    const placeProtection = async ({ kind, triggerPrice, workingType: orderWorkingType }: ProtectionOrderValue) => {
+      const algoParams: Record<string, QueryValue> = { algoType: 'CONDITIONAL', symbol, side, type: kind, triggerPrice, closePosition: true, workingType: orderWorkingType }
+      if (positionSide === 'LONG' || positionSide === 'SHORT') algoParams.positionSide = positionSide
+      const result = await binanceRequest<{ algoId: number }>('POST', '/fapi/v1/algoOrder', algoParams, true)
+      return { orderId: result.algoId }
+    }
+    return await replaceProtectionOrderSet({
+      previous,
+      replacements: replacementValues.filter((value): value is ProtectionOrderValue => value !== undefined),
+      cancel: (order) => binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true),
+      place: placeProtection,
+      remove: (order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true),
+      restore: placeProtection,
+    })
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '设置止盈止损失败' })
   } finally {

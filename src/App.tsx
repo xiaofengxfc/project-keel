@@ -854,9 +854,10 @@ function App() {
         if (response.ok) orders = await response.json() as OrderRow[]
       } catch { /* 保留已有账户数据，空字段默认不更新 */ }
     }
-    const protectionOrders = orders.filter((order) => order.symbol === position.symbol && ['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(order.type))
-    const stop = protectionOrders.find((order) => order.type === 'STOP_MARKET' && order.side === (position.positionAmt > 0 ? 'SELL' : 'BUY') && order.stopPrice > 0)
-    const target = protectionOrders.find((order) => order.type === 'TAKE_PROFIT_MARKET' && order.side === (position.positionAmt > 0 ? 'SELL' : 'BUY') && order.stopPrice > 0)
+    const protectionSide = position.positionAmt > 0 ? 'SELL' : 'BUY'
+    const protectionOrders = orders.filter((order) => order.symbol === position.symbol && order.side === protectionSide && ['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(order.type) && (order.positionSide ?? 'BOTH') === position.positionSide && (order.closePosition === true || order.closePosition === 'true'))
+    const stop = protectionOrders.find((order) => order.type === 'STOP_MARKET' && order.stopPrice > 0)
+    const target = protectionOrders.find((order) => order.type === 'TAKE_PROFIT_MARKET' && order.stopPrice > 0)
     setManagePosition(position)
     setManageStopLoss(stop ? String(stop.stopPrice) : '')
     setManageTakeProfit(target ? String(target.stopPrice) : '')
