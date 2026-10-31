@@ -15,8 +15,8 @@ export function percentageLeverageLimit(brackets: LeverageBracket[], balance: nu
   let limit = 0
   for (let leverage = 1; leverage <= maximum; leverage += 1) {
     const notional = Math.max(0, balance) * fraction * leverage
-    const bracket = brackets.find((item) => notional >= Number(item.notionalFloor) && notional <= Number(item.notionalCap))
-    if (bracket && leverage <= bracket.initialLeverage) limit = leverage
+    const bracketLimit = leverageLimitForNotional(brackets, notional)
+    if (bracketLimit !== null && leverage <= bracketLimit) limit = leverage
   }
   return limit
 }
@@ -52,7 +52,10 @@ export function allowedLeverageOptions(brackets: LeverageBracket[], availableBal
   if (!maximum || !Number.isFinite(availableBalance) || availableBalance <= 0) return []
   const fraction = Math.min(100, Math.max(0, balancePercent)) / 100
   return Array.from({ length: maximum }, (_, index) => index + 1)
-    .filter((leverage) => leverage <= (leverageLimitForNotional(brackets, availableBalance * fraction * leverage) ?? 0))
+    .filter((leverage) => {
+      const bracketLimit = leverageLimitForNotional(brackets, availableBalance * fraction * leverage)
+      return bracketLimit !== null && leverage <= bracketLimit
+    })
 }
 
 export function allSymbolLeverageOptions(brackets: LeverageBracket[]): number[] {
