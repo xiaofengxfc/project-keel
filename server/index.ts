@@ -368,6 +368,14 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
     const existingOrders = [...standardOrders, ...algoOrders.map((order) => ({ ...order, orderId: order.algoId, type: order.orderType ?? order.type, stopPrice: order.triggerPrice ?? order.stopPrice, isAlgoOrder: true }))] as Array<{ orderId: number; symbol: string; type: string; side: string; positionSide?: string; closePosition?: boolean | string; isAlgoOrder?: boolean }>
     const protectSide = side
     const matchingProtectionOrders = existingOrders.filter((order) => order.symbol === symbol && order.side === protectSide && ['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(order.type) && (order.closePosition === true || order.closePosition === 'true') && (order.positionSide ?? 'BOTH') === positionSide)
+    const oldOrdersToCancel = matchingProtectionOrders.filter((order) => order.type === 'STOP_MARKET' ? stopLossProvided : takeProfitProvided)
+    // Binance rejects a second closePosition conditional order in the same direction
+    // (error -4130), so remove the replaced orders before creating their replacements.
+    try {
+      for (const order of oldOrdersToCancel) await binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true)
+    } catch (error) {
+      throw new Error(`撤销旧保护单失败：${error instanceof Error ? error.message : '未知错误'}`)
+    }
     const placed: Array<{ orderId: number }> = []
     try {
       for (const [kind, stopPrice, shouldUpdate] of [['STOP_MARKET', stopLoss, stopLossProvided], ['TAKE_PROFIT_MARKET', takeProfit, takeProfitProvided]] as const) {
@@ -381,14 +389,7 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
       }
     } catch (error) {
       await Promise.allSettled(placed.map((order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true)))
-      throw error
-    }
-    const oldOrdersToCancel = matchingProtectionOrders.filter((order) => order.type === 'STOP_MARKET' ? stopLossProvided : takeProfitProvided)
-    try {
-      for (const order of oldOrdersToCancel) await binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true)
-    } catch (error) {
-      await Promise.allSettled(placed.map((order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true)))
-      throw new Error(`替换旧保护单失败，已撤销新保护单：${error instanceof Error ? error.message : '未知错误'}`)
+      throw new Error(`创建新保护单失败，旧保护单已撤销：${error instanceof Error ? error.message : '未知错误'}`)
     }
     return { orders: placed, canceled: oldOrdersToCancel.length }
   } catch (error) {
