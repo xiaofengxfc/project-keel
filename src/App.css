@@ -285,3 +285,40 @@
   .position-modal .partial-close { padding: 11px; }
   .partial-close-actions button { min-height: 38px; }
 }
+
+/* Partial close control: keep the slider, presets and actions in one compact card. */
+.position-modal .partial-close{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  margin-top:2px;
+  padding:13px 14px 14px;
+  border:1px solid #e4ebe8;
+  border-radius:12px;
+  background:linear-gradient(180deg,#fcfefd 0%,#f8fbfa 100%);
+  box-shadow:0 2px 8px rgba(29,73,57,.04);
+}
+.position-modal .partial-close-head{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#687583;font-size:11px;font-weight:600}
+.position-modal .partial-close-head b{color:#168b63;font-size:16px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.position-modal .partial-close-quantity{display:flex;align-items:baseline;justify-content:space-between;gap:12px;color:#8995a1;font-size:10px;line-height:1.4}
+.position-modal .partial-close-quantity b{color:#334252;font-size:11px;font-variant-numeric:tabular-nums}
+.position-modal .partial-close .binance-range{width:100%;margin:5px 0 0}
+.position-modal .partial-close-scale{display:flex;align-items:center;gap:10px;min-height:26px}
+.position-modal .partial-close-scale>span{flex:none;color:#9aa5ae;font-size:9px}
+.position-modal .partial-close-scale .range-marks{flex:1;padding:0;gap:4px}
+.position-modal .partial-close-scale .range-marks button{flex:1;min-width:0;height:25px;padding:0 3px;border:1px solid #e1e8e4;border-radius:6px;background:#fff;color:#84918d;font-size:10px;font-variant-numeric:tabular-nums}
+.position-modal .partial-close-scale .range-marks button:hover:not(:disabled){background:#eff8f4;color:#168b63}
+.position-modal .partial-close-scale .range-marks button.selected{border-color:#1b9a72;background:#eaf7f1;color:#168b63;font-weight:700}
+.position-modal .partial-close-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:2px}
+.position-modal .partial-close-actions button{min-height:36px;padding:0 10px;border-radius:8px;font-size:11px;font-weight:700;transition:background .15s ease,border-color .15s ease,transform .15s ease}
+.position-modal .partial-close-actions button:active:not(:disabled){transform:translateY(1px)}
+.position-modal .partial-close-actions .partial-button{border-color:#bfe5d5;background:#eff8f4;color:#168b63}
+.position-modal .partial-close-actions .partial-button:hover:not(:disabled){border-color:#1b9a72;background:#e4f5ed}
+.position-modal .partial-close-actions .close-all-button{border-color:#f0d5d5;background:#fff8f8;color:#c16b6b}
+.position-modal .partial-close-actions .close-all-button:hover:not(:disabled){border-color:#dfaaaa;background:#fff1f1}
+.position-modal .partial-close-actions button:disabled{opacity:.5;cursor:not-allowed}
+@media(max-width:760px){
+  .position-modal .partial-close{padding:12px 11px 13px}
+  .position-modal .partial-close-scale{gap:7px}
+  .position-modal .partial-close-scale>span{font-size:8px}
+}
