@@ -38,6 +38,10 @@ export function isTriggeredOrder(type: BinanceOrderType) {
   return type === 'STOP' || type === 'STOP_MARKET' || type === 'TAKE_PROFIT' || type === 'TAKE_PROFIT_MARKET'
 }
 
+export function requiresAlgoEndpoint(type: BinanceOrderType) {
+  return isTriggeredOrder(type) || type === 'TRAILING_STOP_MARKET'
+}
+
 export function isMarketExecution(type: BinanceOrderType) {
   return type === 'MARKET' || type === 'STOP_MARKET' || type === 'TAKE_PROFIT_MARKET' || type === 'TRAILING_STOP_MARKET'
 }
@@ -96,11 +100,13 @@ export function validateBinanceOrder(input: BinanceOrderInput): string | null {
   if (closePosition) {
     if (!['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(input.type)) return '仅止损市价单和止盈市价单支持全仓平仓'
     if (input.reduceOnly) return '全仓平仓不能同时启用只减仓'
-    if (input.quantity) return '全仓平仓不需要填写数量'
+    if (input.quantity !== undefined && input.quantity !== '') return '全仓平仓不需要填写数量'
   } else {
     const quantity = Number(input.quantity)
     if (!Number.isFinite(quantity) || quantity <= 0) return '数量必须是大于 0 的数字'
   }
+
+  if (input.type === 'TRAILING_STOP_MARKET' && closePosition) return '追踪止损单不能使用全仓平仓参数'
 
   if (isPriceOrder(input.type)) {
     const price = Number(input.price)
@@ -124,6 +130,7 @@ export function validateBinanceOrder(input: BinanceOrderInput): string | null {
 
   if (input.positionSide && !['BOTH', 'LONG', 'SHORT'].includes(input.positionSide)) return '请选择有效的持仓方向'
   if (input.reduceOnly && input.positionSide && input.positionSide !== 'BOTH') return '双向持仓模式不能使用只减仓参数'
+  if (input.reduceOnly && input.closePosition) return '只减仓和全仓平仓不能同时使用'
   if (input.workingType && !['MARK_PRICE', 'CONTRACT_PRICE'].includes(input.workingType)) return '请选择有效的触发价格类型'
   return null
 }

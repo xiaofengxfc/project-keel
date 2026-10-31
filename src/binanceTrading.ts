@@ -41,7 +41,7 @@ export function quoteAsset(symbol: string): string {
 }
 
 export function leverageLimitForNotional(brackets: LeverageBracket[], notional: number): number | null {
-  if (!brackets.length) return null
+  if (!brackets.length || !Number.isFinite(notional) || notional < 0) return null
   const ordered = [...brackets].sort((left, right) => Number(left.notionalFloor) - Number(right.notionalFloor))
   const tier = ordered.find((item) => notional >= Number(item.notionalFloor) && notional <= Number(item.notionalCap))
   return tier?.initialLeverage ?? null

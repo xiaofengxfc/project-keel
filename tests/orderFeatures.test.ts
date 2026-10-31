@@ -35,6 +35,8 @@ test('market orders omit limit price while limit and conditional-limit orders re
 test('conditional and trailing orders require valid trigger settings', () => {
   assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', quantity: '1' }) ?? '', /触发价格/)
   assert.equal(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', closePosition: true, stopPrice: '62000' }), null)
+  assert.equal(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', closePosition: true, quantity: '', stopPrice: '62000' }), null)
+  assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', closePosition: true, quantity: '1', stopPrice: '62000' }) ?? '', /不需要填写数量/)
   const closeParams = toBinanceOrderParams({ symbol: 'BTCUSDT', side: 'BUY', type: 'TAKE_PROFIT_MARKET', closePosition: true, stopPrice: '65000', positionSide: 'SHORT' })
   assert.equal(closeParams.quantity, undefined)
   assert.equal(closeParams.closePosition, true)
@@ -43,6 +45,16 @@ test('conditional and trailing orders require valid trigger settings', () => {
   assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'STOP_MARKET', quantity: '1', reduceOnly: true, positionSide: 'LONG', stopPrice: '62000' }) ?? '', /双向持仓/)
   assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'TRAILING_STOP_MARKET', quantity: '1', callbackRate: '6' }) ?? '', /回调率/)
   assert.equal(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'TRAILING_STOP_MARKET', quantity: '1', callbackRate: '0.5' }), null)
+  assert.match(validateBinanceOrder({ symbol: 'BTCUSDT', side: 'SELL', type: 'TRAILING_STOP_MARKET', closePosition: true, callbackRate: '0.5' }) ?? '', /全仓平仓/)
+})
+
+test('trailing order parameters include activation price and callback rate on conditional endpoint', () => {
+  const input: BinanceOrderInput = { symbol: 'BTCUSDT', side: 'SELL', type: 'TRAILING_STOP_MARKET', quantity: '0.01', activationPrice: '65000', callbackRate: '0.5', workingType: 'MARK_PRICE' }
+  assert.equal(validateBinanceOrder(input), null)
+  const params = toBinanceOrderParams(input)
+  assert.equal(params.activationPrice, '65000')
+  assert.equal(params.callbackRate, '0.5')
+  assert.equal(params.workingType, 'MARK_PRICE')
 })
 
 test('protection replacement cancels the full pair before recreating changed and unchanged values', async () => {

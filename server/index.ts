@@ -4,7 +4,7 @@ import 'dotenv/config'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
-import { isMarketExecution, isStepAligned, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
+import { isMarketExecution, isStepAligned, requiresAlgoEndpoint, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
 import { maximumLeverageForBrackets, protectionOrderDirection } from '../src/binanceTrading.js'
 import { replaceProtectionOrderSet, type ProtectionOrderKind, type ProtectionOrderSnapshot, type ProtectionOrderValue } from '../src/protectionOrders.js'
 import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
@@ -234,7 +234,7 @@ app.get<{ Querystring: { symbol?: string } }>('/api/open-orders', async (request
   if (symbol && !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
   try {
     const orders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true)
-    const algoOrders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true).catch(() => [])
+    const algoOrders = await binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true)
     const normalizedAlgoOrders = algoOrders.map((order) => ({
       orderId: order.algoId,
       symbol: order.symbol,
@@ -300,7 +300,11 @@ app.post<{ Body: { symbol?: string; positionSide?: string; quantity?: string } }
     const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; notional?: string; minNotional?: string; maxNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
     const filters = info.symbols.find((item) => item.symbol === symbol)?.filters ?? []
     const quantityText = quantity === undefined ? String(Math.abs(currentAmount)) : quantity
-    for (const filter of filters.filter((item) => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE')) {
+    // A market close uses MARKET_LOT_SIZE when Binance provides it. Checking
+    // both filters can reject a valid close if the two step sizes differ.
+    const quantityFilter = filters.find((item) => item.filterType === 'MARKET_LOT_SIZE') ?? filters.find((item) => item.filterType === 'LOT_SIZE')
+    if (quantityFilter) {
+      const filter = quantityFilter
       if (filter.minQty && Number(filter.minQty) > 0 && closeQuantity < Number(filter.minQty)) return reply.code(400).send({ error: `平仓数量低于 Binance 最小值 (${filter.minQty})` })
       if (filter.maxQty && Number(filter.maxQty) > 0 && closeQuantity > Number(filter.maxQty)) return reply.code(400).send({ error: `平仓数量超过 Binance 最大值 (${filter.maxQty})` })
       if (filter.stepSize && Number(filter.stepSize) > 0 && !isStepAligned(quantityText, filter.stepSize)) return reply.code(400).send({ error: `平仓数量必须符合 Binance 步长 (${filter.stepSize})` })
@@ -428,7 +432,11 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
     const marketSymbol = info.symbols.find((item) => item.symbol === body.symbol.toUpperCase())
     if (!marketSymbol) return reply.code(400).send({ error: '该交易对不支持 Binance USDⓈ-M Futures' })
     const filter = (type: string) => marketSymbol.filters.find((item) => item.filterType === type)
-    const qtyFilters = body.closePosition ? [] : [filter('LOT_SIZE'), ...(isMarketExecution(body.type) ? [filter('MARKET_LOT_SIZE')] : [])].filter((item): item is NonNullable<typeof item> => item !== undefined)
+    // Binance applies MARKET_LOT_SIZE to market and market-triggered orders;
+    // using both filters can reject a valid market quantity when their steps
+    // differ. Limit orders use LOT_SIZE.
+    const quantityFilter = body.closePosition ? undefined : filter(isMarketExecution(body.type) ? 'MARKET_LOT_SIZE' : 'LOT_SIZE') ?? filter('LOT_SIZE')
+    const qtyFilters = quantityFilter ? [quantityFilter] : []
     const priceFilter = filter('PRICE_FILTER')
     const quantity = body.quantity === undefined ? undefined : Number(body.quantity)
     for (const qtyFilter of qtyFilters) {
@@ -446,7 +454,7 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
     const notionalFilter = filter('MIN_NOTIONAL') ?? filter('NOTIONAL')
     const minimumNotional = Number(notionalFilter?.notional ?? notionalFilter?.minNotional)
     const maximumNotional = Number(notionalFilter?.maxNotional)
-    if (quantity !== undefined && minimumNotional > 0) {
+    if (quantity !== undefined && (minimumNotional > 0 || maximumNotional > 0)) {
       let referencePrice = Number(body.price ?? body.stopPrice)
       if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
         const ticker = await binanceRequest<{ price: string }>('GET', '/fapi/v1/ticker/price', { symbol: body.symbol.toUpperCase() })
@@ -459,7 +467,7 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
       }
     }
     const params = toBinanceOrderParams(body) as Record<string, QueryValue>
-    if (isTriggeredOrder(body.type)) {
+    if (requiresAlgoEndpoint(body.type)) {
       const algoParams: Record<string, QueryValue> = {
         algoType: 'CONDITIONAL', symbol: body.symbol.toUpperCase(), side: body.side, type: body.type,
         quantity: params.quantity as string | undefined, price: params.price as string | undefined,
@@ -470,6 +478,8 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
         positionSide: body.positionSide === 'BOTH' ? undefined : body.positionSide,
         workingType: params.workingType as string | undefined,
         priceProtect: params.priceProtect as boolean | undefined,
+        activationPrice: params.activationPrice as string | undefined,
+        callbackRate: params.callbackRate as string | undefined,
       }
       return await binanceRequest('POST', '/fapi/v1/algoOrder', algoParams, true)
     }
