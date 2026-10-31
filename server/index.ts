@@ -64,6 +64,7 @@ const predictionTimeoutMs = Number.isFinite(configuredPredictionTimeoutMs) && co
   ? Math.min(Math.round(configuredPredictionTimeoutMs), 30_000)
   : 10_000
 const predictionDispatcher = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost)(?::|\/)/i.test(predictionServiceUrl) ? new Agent() : undefined
+const explanationAccuracyGate = 0.8
 let serverTimeOffsetMs = 0
 let serverTimeSyncAt = 0
 
@@ -655,6 +656,11 @@ app.post<{ Body: { question: string; context: ExplanationContext } }>('/api/assi
   const question = request.body?.question?.trim()
   if (!question) return reply.code(400).send({ error: '请输入问题' })
   const context = request.body.context
+  const measuredAccuracy = context?.prediction?.validation?.accuracy
+  const validationSamples = context?.prediction?.validation?.testSamples
+  if (!context?.prediction || typeof measuredAccuracy !== 'number' || measuredAccuracy < explanationAccuracyGate || typeof validationSamples !== 'number' || validationSamples < 500) {
+    return { answer: '当前通用预测模型尚未通过 80% 独立测试准确率门槛，暂无足够依据可供解释。请等待模型重新训练和验证。' }
+  }
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (aiKey) headers.Authorization = `Bearer ${aiKey}`
