@@ -1048,7 +1048,7 @@ function App() {
   return <div className="app-shell">
     <header className="topbar">
       <div className="brand"><div className="brand-mark">K</div><div><strong>KEEL</strong><span>TRADING DESK</span></div></div>
-      <div className="top-actions"><div className={`connection ${connected ? 'online' : ''}`}><i />{connected ? `Binance ${health.environment === 'testnet' ? '测试网' : '正式网'} 已连接` : active ? '正在连接 Binance' : '请先收藏币种'}</div><button type="button" className="icon-btn ip-check" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `当前 IP ${publicIp}` : '检测 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
+      <div className="top-actions"><div className={`connection ${connected ? 'online' : ''}`}><i />{connected ? `Binance ${health.environment === 'testnet' ? '测试网' : '正式网'} 已连接` : active ? '正在连接 Binance' : '请先收藏币种'}</div><button type="button" className="icon-btn ip-check" title="检测后端访问 Binance 使用的公网出口 IP" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `出口 IP ${publicIp}` : '检测出口 IP'}</button>{ipError && <span className="ip-error" role="status">{ipError}</span>}<div className="avatar">JD</div></div>
     </header>
     <main className="workspace">
       <MarketList
@@ -1123,7 +1123,7 @@ function App() {
         <button className={bottomTab === 'trades' ? 'active' : ''} onClick={() => setBottomTab('trades')}>成交记录 <span>{trades.length}</span></button>
         <span className="bottom-spacer" />
         <button type="button" className="refresh-account" onClick={() => setPrivateDataRefreshKey((value) => value + 1)} disabled={!health.privateApiConfigured || ordersLoading}>{ordersLoading ? '读取中…' : '刷新'}</button>
-        <button type="button" className="ip-panel-check" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `当前 IP：${publicIp}` : '检测 IP'}</button>
+        <button type="button" className="ip-panel-check" title="检测后端访问 Binance 使用的公网出口 IP" onClick={checkPublicIp} disabled={ipLoading}>{ipLoading ? '检测中…' : publicIp ? `出口 IP：${publicIp}` : '检测出口 IP'}</button>
         <span className="account-state"><i />{health.privateApiConfigured ? '私有 API 已配置' : '未连接私有 API'}</span>
       </div>
       {ordersError && <div className="account-error" role="alert">{ordersError}</div>}

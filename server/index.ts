@@ -110,6 +110,7 @@ app.get('/api/health', async () => ({
 
 const detectCurrentIp = async (_request: FastifyRequest, reply: FastifyReply) => {
   const endpoints = ['https://checkip.amazonaws.com', 'https://api.ipify.org?format=json', 'https://ifconfig.me/ip', 'https://icanhazip.com']
+  let ipv6Address = ''
   for (const endpoint of endpoints) {
     try {
       const response = await fetch(endpoint, { signal: AbortSignal.timeout(4000) })
@@ -117,9 +118,11 @@ const detectCurrentIp = async (_request: FastifyRequest, reply: FastifyReply) =>
       const body = await response.text()
       let address = body.trim()
       if (address.startsWith('{')) address = (JSON.parse(address) as { ip?: string }).ip?.trim() ?? ''
-      if (isIP(address)) return { ip: address }
+      if (isIP(address) === 4) return { ip: address }
+      if (!ipv6Address && isIP(address) === 6) ipv6Address = address
     } catch { /* 单个公网检测源不可用时，继续尝试备用源。 */ }
   }
+  if (ipv6Address) return { ip: ipv6Address }
   return reply.code(502).send({ error: '当前 IP 检测源暂不可用，请稍后重试' })
 }
 
