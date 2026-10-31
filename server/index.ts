@@ -403,10 +403,27 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
       const result = await binanceRequest<{ algoId: number }>('POST', '/fapi/v1/algoOrder', algoParams, true)
       return { orderId: result.algoId }
     }
+    const waitForProtectionCancellation = async () => {
+      if (!matchingProtectionOrders.length) return
+      const oldStandardIds = new Set(matchingProtectionOrders.filter((order) => !order.isAlgoOrder).map((order) => String(order.orderId)))
+      const oldAlgoIds = new Set(matchingProtectionOrders.filter((order) => order.isAlgoOrder).map((order) => String(order.orderId)))
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const [currentStandard, currentAlgo] = await Promise.all([
+          binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openOrders', { symbol }, true),
+          binanceRequest<Array<Record<string, unknown>>>('GET', '/fapi/v1/openAlgoOrders', { symbol }, true),
+        ])
+        const standardStillOpen = currentStandard.some((order) => oldStandardIds.has(String(order.orderId)))
+        const algoStillOpen = currentAlgo.some((order) => oldAlgoIds.has(String(order.algoId)))
+        if (!standardStillOpen && !algoStillOpen) return
+        await new Promise((resolve) => setTimeout(resolve, 120))
+      }
+      throw new Error('Binance 保护单撤销尚未生效，请稍后重试')
+    }
     return await replaceProtectionOrderSet({
       previous,
       replacements: replacementValues.filter((value): value is ProtectionOrderValue => value !== undefined),
       cancel: (order) => binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true),
+      afterCancel: waitForProtectionCancellation,
       place: placeProtection,
       remove: (order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true),
       restore: placeProtection,
