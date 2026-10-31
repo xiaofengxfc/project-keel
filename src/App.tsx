@@ -751,7 +751,12 @@ function App() {
   const activeMinQty = isMarketExecution(orderType) ? activeRules?.marketMinQty ?? activeRules?.minQty : activeRules?.minQty
   const activeLeverageBrackets = useMemo(() => leverageBracketsSymbol === active ? leverageBrackets : [], [active, leverageBrackets, leverageBracketsSymbol])
   const leverageOptions = useMemo(() => allSymbolLeverageOptions(activeLeverageBrackets), [activeLeverageBrackets])
-  const selectedLeverage = leverageSelections[active] ?? (leverageOptions.includes(Number(leverage)) ? Number(leverage) : leverageOptions[0] ?? 0)
+  const storedLeverage = leverageSelections[active]
+  const selectedLeverage = Number.isInteger(storedLeverage) && storedLeverage >= 1 && storedLeverage <= (leverageOptions.at(-1) ?? 0)
+    ? storedLeverage
+    : Number.isInteger(Number(leverage)) && Number(leverage) >= 1 && Number(leverage) <= (leverageOptions.at(-1) ?? 0)
+      ? Number(leverage)
+      : leverageOptions[0] ?? 0
   const activeSliderPrice = orderPrice ? Number(orderPrice) : last ?? 0
   const sliderLeverage = leverageForBalancePercent(activeLeverageBrackets, Number(accountBalance) || 0, orderPercent || 100, selectedLeverage || 1)
   const maximumAllowedLeverage = sliderLeverage.maximum
@@ -941,7 +946,11 @@ function App() {
   const applyTradingSettings = async () => {
     setOrderMessage('正在更新杠杆与保证金模式…')
     try {
-      const leverageToApply = orderPercent > 0 ? effectiveSliderLeverage : selectedLeverage || Number(leverage)
+    const requestedLeverage = Number(leverage)
+    if (!Number.isInteger(requestedLeverage) || requestedLeverage < 1 || requestedLeverage > leverageMaximum) {
+      throw new Error(`杠杆请输入 1 到 ${leverageMaximum} 之间的整数`)
+    }
+    const leverageToApply = orderPercent > 0 ? effectiveSliderLeverage : requestedLeverage
       const leverageResponse = await fetch('/api/account/leverage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: active, leverage: leverageToApply }) })
       const leverageResult = await leverageResponse.json() as { error?: string; leverage?: number }
       if (!leverageResponse.ok) throw new Error(leverageResult.error ?? '更新杠杆失败')
@@ -1057,7 +1066,7 @@ function App() {
           {!closePosition && <div className="percent-slider-control"><div className="slider-label-row"><span>仓位比例</span><b>{orderPercent || 0}%</b></div><input className="binance-range" style={{ '--range-progress': `${orderPercent}%` } as React.CSSProperties} type="range" min="0" max="100" step="1" value={orderPercent} onChange={(event) => applyPercentToQty(Number(event.target.value))} disabled={!health.privateApiConfigured || !accountBalance} /><div className="range-marks">{[0, 25, 50, 75, 100].map((percent) => <button key={percent} type="button" className={orderPercent === percent ? 'selected' : ''} onClick={() => applyPercentToQty(percent)} disabled={!health.privateApiConfigured || !accountBalance}>{percent}%</button>)}</div>{activeSliderSize && <small className="order-estimate">预估数量 {activeSliderSize.inputAmount} {displayedAmountUnitLabel} · 名义价值 {formatPrice(activeSliderSize.notional)} USDT{leverageClampedByNotional ? ` · 已按档位上限调整为 ${effectiveSliderLeverage}x` : ''}</small>}</div>}
           <div className="order-settings-grid">
             <label>保证金模式<select value={marginType} onChange={(event) => setMarginType(event.target.value as typeof marginType)}><option value="CROSSED">全仓</option><option value="ISOLATED">逐仓</option></select></label>
-            <label>杠杆<div className="input-unit leverage-input"><input type="number" min="1" max={leverageMaximum} step="1" value={leverage} onChange={(event) => setLeverage(event.target.value)} onBlur={() => setLeverageForActiveSymbol(Number(leverage))} disabled={leverageBracketsLoading || !activeLeverageBrackets.length} /><span>x</span></div><small className="order-estimate">{leverageBracketsError ? leverageBracketsError : leverageBracketsLoading ? '正在读取 Binance 杠杆档位…' : `当前币种 Binance 最大杠杆 ${leverageMaximum}x${maximumAllowedLeverage ? ` · 当前比例保证金档位上限 ${maximumAllowedLeverage}x` : ''}`}</small>{leverageBracketsError && <button type="button" className="leverage-retry" onClick={() => setLeverageBracketsReloadKey((value) => value + 1)}>重试读取</button>}</label>
+            <label>杠杆<div className="input-unit leverage-input"><input type="number" min="1" max={leverageMaximum} step="1" value={leverage} onChange={(event) => setLeverage(event.target.value)} onBlur={() => setLeverageForActiveSymbol(Number(leverage))} disabled={leverageBracketsLoading || !activeLeverageBrackets.length} /><span>x</span></div><small className="order-estimate">{leverageBracketsError ? leverageBracketsError : leverageBracketsLoading ? '正在读取 Binance 杠杆档位…' : `当前币种 Binance 最大杠杆 ${leverageMaximum}x${maximumAllowedLeverage ? ` · 当前比例保证金档位上限 ${maximumAllowedLeverage}x` : ''}`}</small>{orderPercent > 0 && maximumAllowedLeverage > 0 && Number(leverage) > maximumAllowedLeverage && <small className="order-estimate leverage-warning">当前仓位比例下实际会按 {maximumAllowedLeverage}x 发送</small>}{leverageBracketsError && <button type="button" className="leverage-retry" onClick={() => setLeverageBracketsReloadKey((value) => value + 1)}>重试读取</button>}</label>
             <label>持仓模式<select value={hedgeMode ? 'dual' : 'oneway'} onChange={() => void toggleHedgeMode()} disabled={!health.privateApiConfigured || !health.tradingEnabled}><option value="oneway">单向持仓</option><option value="dual">双向持仓</option></select></label>
             {(isTriggeredOrder(orderType) || orderType === 'TRAILING_STOP_MARKET') && <label>触发参考<select value={workingType} onChange={(event) => setWorkingType(event.target.value as typeof workingType)}>{workingTypeOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>}
           </div>
