@@ -661,11 +661,14 @@ function App() {
   const chartCandles = useMemo(() => marketDataIsCurrent ? candles : [], [candles, marketDataIsCurrent])
   const last = activeQuote?.price ?? (marketDataIsCurrent ? price ?? candles[candles.length - 1]?.close ?? null : null)
   const activeChange = activeQuote?.change ?? change
+  const analysisReferencePrice = chartCandles.length > 1
+    ? chartCandles[chartCandles.length - 2]?.close ?? null
+    : chartCandles[chartCandles.length - 1]?.close ?? null
   // 自动分析以最近已收盘 K 线为准，避免盘中价格变化让分析线频繁跳动。
   const analysisFrames = useMemo(() => ({ ...analysisCandlesByInterval, [interval]: chartCandles }), [analysisCandlesByInterval, chartCandles, interval])
   const multiTimeframeAnalysis = useMemo(() => analysisEnabled ? analyzeMultipleTimeframes(analysisFrames, last, interval, analysisIndicators) : null, [analysisFrames, analysisEnabled, analysisIndicators, interval, last])
   const analysis: MarketAnalysis = !analysisEnabled
-    ? { environment: '数据不足', direction: '观望', support: null, resistance: null, stopLoss: null, takeProfit: null, entry: last, status: '自动分析已关闭', rr: null, atr: null, indicatorSignals: [], supportingIndicators: 0, opposingIndicators: 0 }
+    ? { environment: '数据不足', direction: '观望', support: null, resistance: null, stopLoss: null, takeProfit: null, entry: analysisReferencePrice ?? last, status: '自动分析已关闭', rr: null, atr: null, indicatorSignals: [], supportingIndicators: 0, opposingIndicators: 0 }
     : multiTimeframeAnalysis?.byTimeframe[interval] ?? analyzeMarket(chartCandles, last, analysisIndicators)
   const analysisView = multiTimeframeAnalysis?.byTimeframe[analysisViewInterval] ?? analysis
   const chartIndicatorValues = useMemo(() => calculateTechnicalIndicators(chartCandles), [chartCandles])
