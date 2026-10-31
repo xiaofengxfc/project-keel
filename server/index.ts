@@ -296,7 +296,7 @@ app.post<{ Body: { symbol?: string; positionSide?: string; quantity?: string } }
     if (!position || !Number.isFinite(currentAmount) || currentAmount === 0) return reply.code(400).send({ error: '该方向当前没有可平仓位' })
     const closeQuantity = quantity === undefined ? Math.abs(currentAmount) : Number(quantity)
     if (closeQuantity > Math.abs(currentAmount)) return reply.code(400).send({ error: '平仓数量不能大于当前持仓数量' })
-    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; notional?: string; minNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
+    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; notional?: string; minNotional?: string; maxNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
     const filters = info.symbols.find((item) => item.symbol === symbol)?.filters ?? []
     const quantityText = quantity === undefined ? String(Math.abs(currentAmount)) : quantity
     for (const filter of filters.filter((item) => item.filterType === 'LOT_SIZE' || item.filterType === 'MARKET_LOT_SIZE')) {
@@ -306,8 +306,10 @@ app.post<{ Body: { symbol?: string; positionSide?: string; quantity?: string } }
     }
     const notionalFilter = filters.find((item) => item.filterType === 'MIN_NOTIONAL' || item.filterType === 'NOTIONAL')
     const minimumNotional = Number(notionalFilter?.notional ?? notionalFilter?.minNotional)
+    const maximumNotional = Number(notionalFilter?.maxNotional)
     const markPrice = Number(position.markPrice)
     if (minimumNotional > 0 && Number.isFinite(markPrice) && closeQuantity * markPrice < minimumNotional) return reply.code(400).send({ error: `平仓名义价值低于 Binance 最小值 (${minimumNotional} USDT)` })
+    if (maximumNotional > 0 && Number.isFinite(markPrice) && closeQuantity * markPrice > maximumNotional) return reply.code(400).send({ error: `平仓名义价值超过 Binance 最大值 (${maximumNotional} USDT)` })
     const side = currentAmount > 0 ? 'SELL' : 'BUY'
     const params: Record<string, QueryValue> = { symbol, side, type: 'MARKET', quantity: quantityText }
     if (positionSide === 'LONG' || positionSide === 'SHORT') params.positionSide = positionSide
@@ -406,7 +408,7 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
   const validationError = validateBinanceOrder(body)
   if (validationError) return reply.code(400).send({ error: validationError })
   try {
-    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; tickSize?: string; minPrice?: string; maxPrice?: string; notional?: string; minNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
+    const info = await binanceRequest<{ symbols: Array<{ symbol: string; filters: Array<{ filterType: string; minQty?: string; maxQty?: string; stepSize?: string; tickSize?: string; minPrice?: string; maxPrice?: string; notional?: string; minNotional?: string; maxNotional?: string }> }> }>('GET', '/fapi/v1/exchangeInfo')
     const marketSymbol = info.symbols.find((item) => item.symbol === body.symbol.toUpperCase())
     if (!marketSymbol) return reply.code(400).send({ error: '该交易对不支持 Binance USDⓈ-M Futures' })
     const filter = (type: string) => marketSymbol.filters.find((item) => item.filterType === type)
@@ -427,13 +429,18 @@ app.post<{ Body: OrderBody }>('/api/order', async (request, reply) => {
     }
     const notionalFilter = filter('MIN_NOTIONAL') ?? filter('NOTIONAL')
     const minimumNotional = Number(notionalFilter?.notional ?? notionalFilter?.minNotional)
+    const maximumNotional = Number(notionalFilter?.maxNotional)
     if (quantity !== undefined && minimumNotional > 0) {
       let referencePrice = Number(body.price ?? body.stopPrice)
       if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
         const ticker = await binanceRequest<{ price: string }>('GET', '/fapi/v1/ticker/price', { symbol: body.symbol.toUpperCase() })
         referencePrice = Number(ticker.price)
       }
-      if (Number.isFinite(referencePrice) && referencePrice > 0 && quantity * referencePrice < minimumNotional) return reply.code(400).send({ error: `订单名义价值低于 Binance 最小值 (${minimumNotional} USDT)` })
+      if (Number.isFinite(referencePrice) && referencePrice > 0) {
+        const notional = quantity * referencePrice
+        if (notional < minimumNotional) return reply.code(400).send({ error: `订单名义价值低于 Binance 最小值 (${minimumNotional} USDT)` })
+        if (maximumNotional > 0 && notional > maximumNotional) return reply.code(400).send({ error: `订单名义价值超过 Binance 最大值 (${maximumNotional} USDT)` })
+      }
     }
     const params = toBinanceOrderParams(body) as Record<string, QueryValue>
     if (isTriggeredOrder(body.type)) {
