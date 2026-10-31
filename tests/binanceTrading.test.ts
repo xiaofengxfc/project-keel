@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { allowedLeverageOptions, buildCloseOrder, leverageForBalancePercent, leverageLimitForNotional, orderSizeAtBalancePercent, partialCloseQuantity, percentageLeverageLimit, protectionOrderDirection, quantityFromAmount, quoteAsset } from '../src/binanceTrading.ts'
+import { allowedLeverageOptions, buildCloseOrder, leverageForBalancePercent, leverageLimitForNotional, maximumLeverageForBrackets, orderSizeAtBalancePercent, partialCloseQuantity, percentageLeverageLimit, protectionOrderDirection, quantityFromAmount, quoteAsset } from '../src/binanceTrading.ts'
 
 const brackets = [
   { bracket: 1, initialLeverage: 125, notionalFloor: '0', notionalCap: '50000' },
@@ -14,6 +14,13 @@ test('leverage limit follows the symbol notional bracket', () => {
   assert.equal(leverageLimitForNotional([], 12_000), null)
   assert.deepEqual(allowedLeverageOptions(brackets, 100), Array.from({ length: 125 }, (_, index) => index + 1))
   assert.ok(allowedLeverageOptions(brackets, 1_000).length <= allowedLeverageOptions(brackets, 1_000, 25).length)
+})
+
+test('symbol maximum leverage uses the lowest notional tier even when brackets are unsorted', () => {
+  assert.equal(maximumLeverageForBrackets([
+    { bracket: 2, initialLeverage: 50, notionalFloor: '50000', notionalCap: '250000' },
+    { bracket: 1, initialLeverage: 125, notionalFloor: '0', notionalCap: '50000' },
+  ]), 125)
 })
 
 test('coin and USDT amounts convert to step aligned quantities by rounding down', () => {

@@ -10,7 +10,7 @@ export type LeverageBracket = {
 export type OrderAmountUnit = 'asset' | 'usdt'
 
 export function percentageLeverageLimit(brackets: LeverageBracket[], balance: number, percent: number): number {
-  const maximum = Math.max(0, ...brackets.map((item) => item.initialLeverage))
+  const maximum = maximumLeverageForBrackets(brackets) ?? 0
   const fraction = Math.max(0, Math.min(100, percent)) / 100
   let limit = 0
   for (let leverage = 1; leverage <= maximum; leverage += 1) {
@@ -48,7 +48,7 @@ export function leverageLimitForNotional(brackets: LeverageBracket[], notional: 
 }
 
 export function allowedLeverageOptions(brackets: LeverageBracket[], availableBalance: number, balancePercent = 100): number[] {
-  const maximum = Math.max(0, ...brackets.map((item) => item.initialLeverage))
+  const maximum = maximumLeverageForBrackets(brackets) ?? 0
   if (!maximum || !Number.isFinite(availableBalance) || availableBalance <= 0) return []
   const fraction = Math.min(100, Math.max(0, balancePercent)) / 100
   return Array.from({ length: maximum }, (_, index) => index + 1)
@@ -56,8 +56,15 @@ export function allowedLeverageOptions(brackets: LeverageBracket[], availableBal
 }
 
 export function allSymbolLeverageOptions(brackets: LeverageBracket[]): number[] {
-  const maximum = Math.max(0, ...brackets.map((item) => item.initialLeverage))
+  const maximum = maximumLeverageForBrackets(brackets) ?? 0
   return Array.from({ length: maximum }, (_, index) => index + 1)
+}
+
+export function maximumLeverageForBrackets(brackets: LeverageBracket[]): number | null {
+  const firstTier = [...brackets]
+    .filter((item) => Number.isFinite(Number(item.initialLeverage)) && Number(item.initialLeverage) >= 1)
+    .sort((left, right) => Number(left.notionalFloor) - Number(right.notionalFloor))[0]
+  return firstTier ? Number(firstTier.initialLeverage) : null
 }
 
 export function quantityFromAmount(amount: number, unit: OrderAmountUnit, price: number, stepSize: string): string {

@@ -5,7 +5,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import cors from '@fastify/cors'
 import { tradableUsdtPerpetuals, type BinanceExchangeSymbol } from '../src/binanceSymbols.js'
 import { isMarketExecution, isStepAligned, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.js'
-import { protectionOrderDirection } from '../src/binanceTrading.js'
+import { maximumLeverageForBrackets, protectionOrderDirection } from '../src/binanceTrading.js'
 import { getBinanceApiCredentials, getBinanceEnvironmentConfig } from '../src/binanceEnvironment.js'
 
 const app = Fastify({ logger: true })
@@ -189,9 +189,9 @@ app.post<{ Body: { symbol?: string; leverage?: number } }>('/api/account/leverag
   if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
   if (!Number.isInteger(leverage) || leverage < 1) return reply.code(400).send({ error: '杠杆必须是大于等于 1 的整数' })
   try {
-    const rows = await binanceRequest<Array<{ symbol: string; brackets: Array<{ initialLeverage: number }> }>>('GET', '/fapi/v1/leverageBracket', { symbol }, true)
+    const rows = await binanceRequest<Array<{ symbol: string; brackets: Array<{ initialLeverage: number; notionalFloor?: string; notionalCap?: string }> }>>('GET', '/fapi/v1/leverageBracket', { symbol }, true)
     const row = rows.find((item) => item.symbol === symbol)
-    const maximum = Math.max(0, ...(row?.brackets ?? []).map((item) => Number(item.initialLeverage)).filter(Number.isFinite))
+    const maximum = maximumLeverageForBrackets((row?.brackets ?? []).map((item, index) => ({ bracket: index + 1, initialLeverage: Number(item.initialLeverage), notionalFloor: item.notionalFloor ?? '0', notionalCap: item.notionalCap ?? Number.MAX_SAFE_INTEGER.toString() })))
     if (!maximum) return reply.code(503).send({ error: '未读取到该币种的真实杠杆上限' })
     if (leverage > maximum) return reply.code(400).send({ error: `杠杆超过 ${symbol} 的真实最大值 ${maximum}x` })
     return await binanceRequest('POST', '/fapi/v1/leverage', { symbol, leverage }, true)
