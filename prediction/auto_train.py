@@ -35,7 +35,7 @@ def main() -> None:
     parser.add_argument("--start-time", type=int, default=int(os.getenv("PREDICTION_START_TIME", "1704067200000")))
     parser.add_argument("--data-dir", type=Path, default=Path(os.getenv("PREDICTION_DATA_DIR", "data")))
     parser.add_argument("--model-root", type=Path, default=Path(os.getenv("PREDICTION_MODEL_DIR", "prediction/models")))
-    parser.add_argument("--min-accuracy", type=float, default=float(os.getenv("PREDICTION_MIN_ACCURACY", "0")))
+    parser.add_argument("--min-accuracy", type=float, default=float(os.getenv("PREDICTION_MIN_ACCURACY", "0.8")))
     parser.add_argument("--min-test-samples", type=int, default=int(os.getenv("PREDICTION_MIN_TEST_SAMPLES", "500")))
     args = parser.parse_args()
     symbols = sorted({item.strip().upper() for item in args.symbols.split(",") if item.strip()})

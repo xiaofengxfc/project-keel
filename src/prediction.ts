@@ -24,6 +24,13 @@ export type PredictionAssessment = {
   detail: string
 }
 
+export const MIN_PREDICTION_ACCURACY = 0.8
+
+/** Only expose directional output after an independently measured accuracy gate. */
+export function isPredictionEligible(prediction: PredictionResult | null) {
+  return Boolean(prediction && prediction.validation && typeof prediction.validation.accuracy === 'number' && prediction.validation.accuracy >= MIN_PREDICTION_ACCURACY && typeof prediction.validation.testSamples === 'number' && prediction.validation.testSamples >= 500)
+}
+
 function finiteProbability(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
 }

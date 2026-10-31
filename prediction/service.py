@@ -92,7 +92,7 @@ class ModelState:
             (interval, self.model_root / interval)
             for interval in ("15m", "1h", "4h", "1d")
         ]
-        candidates.extend([("current", self.model_root / "current"), ("*", self.model_root)])
+        candidates.append(("*", self.model_root))
         for key, model_dir in candidates:
             if key in self.bundles or not model_dir.is_dir():
                 continue
@@ -113,7 +113,7 @@ class ModelState:
         # eligible when its metadata explicitly matches this request, so a
         # stale single-symbol/1h model can never be applied to another coin or
         # timeframe by accident.
-        for key in (interval, "*", "current"):
+        for key in (interval, "*"):
             bundle = self.bundles.get(key)
             if bundle is None:
                 continue

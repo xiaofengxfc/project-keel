@@ -67,5 +67,7 @@ POST /predict
 python -m prediction.auto_train --symbols BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT --interval 1h
 ```
 
+重训练任务默认要求候选模型在独立测试集达到 80% 准确率（可用 `PREDICTION_MIN_ACCURACY` 配置），样本不足或准确率未达标时不会晋级。当前已训练模型测试准确率约 38.6%，因此会被前端和 AI 解释层的 80% 门槛拦下，不提供方向信号。准确率门槛是发布筛选规则，不代表未来命中率保证；滚动回测、覆盖率和实盘表现仍需持续跟踪。
+
 重训练完成后重启本地推理服务，使其加载新模型。不要把自动重训练直接连接到下单逻辑。
 
