@@ -187,8 +187,13 @@ app.post<{ Body: { symbol?: string; leverage?: number } }>('/api/account/leverag
   const symbol = request.body?.symbol?.toUpperCase()
   const leverage = Number(request.body?.leverage)
   if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请提供有效的交易对' })
-  if (!Number.isInteger(leverage) || leverage < 1 || leverage > 125) return reply.code(400).send({ error: '杠杆必须是 1 到 125 的整数' })
+  if (!Number.isInteger(leverage) || leverage < 1) return reply.code(400).send({ error: '杠杆必须是大于等于 1 的整数' })
   try {
+    const rows = await binanceRequest<Array<{ symbol: string; brackets: Array<{ initialLeverage: number }> }>>('GET', '/fapi/v1/leverageBracket', { symbol }, true)
+    const row = rows.find((item) => item.symbol === symbol)
+    const maximum = Math.max(0, ...(row?.brackets ?? []).map((item) => Number(item.initialLeverage)).filter(Number.isFinite))
+    if (!maximum) return reply.code(503).send({ error: '未读取到该币种的真实杠杆上限' })
+    if (leverage > maximum) return reply.code(400).send({ error: `杠杆超过 ${symbol} 的真实最大值 ${maximum}x` })
     return await binanceRequest('POST', '/fapi/v1/leverage', { symbol, leverage }, true)
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '更新杠杆失败' })

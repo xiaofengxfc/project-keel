@@ -138,5 +138,34 @@
 .order-content .risk-row.manual input{display:block;appearance:none;background:#fff;border:1px solid #dfe5ea;border-radius:6px;color:#243142;box-shadow:inset 0 1px 2px #1724330a;outline:none;}
 .order-content .risk-row.manual input:focus{border-color:#1b9a72;box-shadow:0 0 0 2px #1b9a7222;}
 .order-content .risk-row.manual input::placeholder{color:#a6afb8}
+.manual-protection-note{display:block;margin-top:-7px;margin-bottom:10px;color:#168b63;font-size:10px;line-height:1.5}
 .leverage-modal .leverage-range{margin-top:18px}
 
+/* Shared Binance-style control polish. */
+.percent-slider-control{box-shadow:0 1px 2px rgba(24,37,52,.03)}
+.binance-range,.leverage-range{height:6px;background:linear-gradient(90deg,#1b9a72 0%,#1b9a72 var(--range-progress,0%),#e5eaee var(--range-progress,0%),#e5eaee 100%);}
+.binance-range:focus-visible,.leverage-range:focus-visible{outline:2px solid #1b9a7244;outline-offset:5px}
+.binance-range::-webkit-slider-runnable-track,.leverage-range::-webkit-slider-runnable-track{height:6px;border-radius:99px;background:transparent}
+.binance-range::-moz-range-track,.leverage-range::-moz-range-track{height:6px;border-radius:99px;background:transparent}
+.binance-range::-moz-range-progress,.leverage-range::-moz-range-progress{height:6px;border-radius:99px;background:#1b9a72}
+.binance-range::-webkit-slider-thumb,.leverage-range::-webkit-slider-thumb{width:18px;height:18px;border-width:4px;transition:transform .15s ease,box-shadow .15s ease}
+.binance-range:hover::-webkit-slider-thumb,.leverage-range:hover::-webkit-slider-thumb{transform:scale(1.12);box-shadow:0 2px 7px rgba(27,154,114,.28)}
+.range-marks{padding-top:2px}
+.range-marks button{min-width:34px;border-radius:5px;transition:background .15s ease,color .15s ease}
+.range-marks button:hover:not(:disabled){background:#eff8f4;color:#168b63}
+.leverage-current{padding:12px 14px;border:1px solid #e8edf0;border-radius:10px;background:#fbfcfd}
+.leverage-current b{font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.leverage-note{padding:9px 10px;border-radius:7px;background:#f7f9fa}
+.analysis-period-tabs{padding:3px;border:1px solid #e6ebee;border-radius:9px;background:#f7f9fa}
+.analysis-period-tabs button{border:0;border-radius:6px;transition:background .15s ease,color .15s ease}
+.analysis-period-tabs button.active{box-shadow:0 1px 3px rgba(24,37,52,.08)}
+.analysis-period-focus small{color:#168b63;font-size:9px}
+.protection-mode-row{padding:3px;border:1px solid #e6ebee;border-radius:9px;background:#f7f9fa}
+.protection-mode-row button{border:0!important;border-radius:6px;transition:background .15s ease,color .15s ease}
+.protection-mode-row button.selected{box-shadow:0 1px 3px rgba(24,37,52,.08)}
+.manual-protection-note{padding:7px 9px;border-radius:6px;background:#eff8f4}
+.position-modal .partial-close{padding:10px;border:1px solid #e8edf0;border-radius:9px;background:#fbfcfd}
+.position-modal .partial-close .binance-range{margin-top:9px}
+@media(max-width:760px){.leverage-modal{padding:16px}.leverage-current{margin-top:16px}.analysis-period-tabs{gap:3px}.analysis-period-tabs button{padding:8px 4px}.position-modal .partial-close{padding:9px}}
+
+.leverage-scale{display:flex;justify-content:space-between;gap:5px;margin:3px 0 10px}.leverage-scale button{border:1px solid #e3e8ec;border-radius:999px;background:#fff;color:#7c8895;padding:4px 7px;font-size:9px;cursor:pointer}.leverage-scale button.active{border-color:#1b9a72;background:#eff8f4;color:#168b63;font-weight:700}.analysis-period-focus small{color:#168b63;font-size:9px}.binance-range:focus-visible,.leverage-range:focus-visible{box-shadow:0 0 0 3px #1b9a7228}
