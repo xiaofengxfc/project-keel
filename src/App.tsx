@@ -3,7 +3,7 @@ import './App.css'
 import LiveChart from './LiveChart'
 import { analyzeMarket, analyzeMultipleTimeframes, type MarketAnalysis } from './marketAnalysis'
 import type { BinanceSymbolCatalogItem } from './binanceSymbols'
-import { isMarketExecution, isPriceOrder, isTriggeredOrder, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput, type BinanceOrderType } from './binanceOrders'
+import { isMarketExecution, isPriceOrder, isTriggeredOrder, requiresAlgoEndpoint, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput, type BinanceOrderType } from './binanceOrders'
 import { allSymbolLeverageOptions, leverageForBalancePercent, leverageLimitForNotional, maximumLeverageForBrackets, orderSizeAtBalancePercent, partialCloseQuantity, quantityFromAmount, quoteAsset, type LeverageBracket, type OrderAmountUnit } from './binanceTrading'
 import { parseWatchlist, reorderWatchlist, WATCHLIST_STORAGE_KEY } from './watchlist'
 import { DEFAULT_ANALYSIS_INDICATORS, DEFAULT_CHART_INDICATORS, type AnalysisIndicatorKey, type ChartIndicatorKey, calculateTechnicalIndicators } from './technicalIndicators'
@@ -903,7 +903,7 @@ function App() {
         reduceOnly: reduceOnly || undefined,
         closePosition: closePosition || undefined,
         positionSide: effectivePositionSide,
-        workingType: isTriggeredOrder(orderType) || orderType === 'TRAILING_STOP_MARKET' ? workingType : undefined,
+        workingType: requiresAlgoEndpoint(orderType) ? workingType : undefined,
         priceProtect: priceProtect && isTriggeredOrder(orderType) ? true : undefined,
         activationPrice: orderType === 'TRAILING_STOP_MARKET' ? activationPrice || undefined : undefined,
         callbackRate: orderType === 'TRAILING_STOP_MARKET' ? callbackRate : undefined,
@@ -1084,7 +1084,7 @@ function App() {
             <label>保证金模式<select value={marginType} onChange={(event) => setMarginType(event.target.value as typeof marginType)}><option value="CROSSED">全仓</option><option value="ISOLATED">逐仓</option></select></label>
             <label>杠杆<div className="input-unit leverage-input"><input type="number" min="1" max={leverageInputMaximum} step="1" value={leverage} onChange={(event) => setLeverage(event.target.value)} onBlur={() => setLeverageForActiveSymbol(Number(leverage))} disabled={leverageBracketsLoading || !activeLeverageBrackets.length} /><span>x</span></div><small className="order-estimate">{leverageBracketsError ? leverageBracketsError : leverageBracketsLoading ? '正在读取 Binance 杠杆档位…' : `币种理论最大杠杆 ${leverageMaximum}x · 当前名义价值档位上限 ${orderLeverageLimit}x`}</small>{leverageBracketsError && <button type="button" className="leverage-retry" onClick={() => setLeverageBracketsReloadKey((value) => value + 1)}>重试读取</button>}</label>
             <label>持仓模式<select value={hedgeMode ? 'dual' : 'oneway'} onChange={() => void toggleHedgeMode()} disabled={!health.privateApiConfigured || !health.tradingEnabled}><option value="oneway">单向持仓</option><option value="dual">双向持仓</option></select></label>
-            {(isTriggeredOrder(orderType) || orderType === 'TRAILING_STOP_MARKET') && <label>触发参考<select value={workingType} onChange={(event) => setWorkingType(event.target.value as typeof workingType)}>{workingTypeOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>}
+            {requiresAlgoEndpoint(orderType) && <label>触发参考<select value={workingType} onChange={(event) => setWorkingType(event.target.value as typeof workingType)}>{workingTypeOptions.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>}
           </div>
           {!hedgeMode && <label className="order-toggle"><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} disabled={closePosition} /><span>只减仓</span></label>}
           {['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(orderType) && <label className="order-toggle"><input type="checkbox" checked={closePosition} onChange={(event) => { setClosePosition(event.target.checked); if (event.target.checked) setReduceOnly(false) }} /><span>平掉该方向全部仓位</span></label>}

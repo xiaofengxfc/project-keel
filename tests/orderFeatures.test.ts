@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { floorToStep, isStepAligned, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.ts'
+import { floorToStep, isStepAligned, requiresAlgoEndpoint, toBinanceOrderParams, validateBinanceOrder, type BinanceOrderInput } from '../src/binanceOrders.ts'
 import { calculateTechnicalIndicators } from '../src/technicalIndicators.ts'
 import { replaceProtectionOrderSet, type ProtectionOrderSnapshot, type ProtectionOrderValue } from '../src/protectionOrders.ts'
 
@@ -55,6 +55,8 @@ test('trailing order parameters include activation price and callback rate on co
   assert.equal(params.activationPrice, '65000')
   assert.equal(params.callbackRate, '0.5')
   assert.equal(params.workingType, 'MARK_PRICE')
+  assert.equal(requiresAlgoEndpoint(input.type), true)
+  assert.equal(requiresAlgoEndpoint('MARKET'), false)
 })
 
 test('protection replacement cancels the full pair before recreating changed and unchanged values', async () => {
