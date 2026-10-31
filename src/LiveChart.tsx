@@ -171,6 +171,7 @@ export default function LiveChart({ data, marketKey = '', currentPrice = null, t
     })
     observer.observe(element)
     return () => {
+      savedVisibleRange.current = chart.timeScale().getVisibleLogicalRange() ?? savedVisibleRange.current
       observer.disconnect()
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
       chart.unsubscribeClick(clickHandler)
@@ -213,7 +214,11 @@ export default function LiveChart({ data, marketKey = '', currentPrice = null, t
       series.setData(data.map((candle) => ({ ...candle, time: candle.time as Time })))
       if (!previous.length && data.length) {
         const savedRange = savedVisibleRange.current
-        chart?.timeScale().setVisibleLogicalRange(savedRange ?? { from: Math.max(0, data.length - 120), to: data.length + 4 })
+        // Keep a stable window for every symbol, including when an indicator
+        // change rebuilds the chart. Small-cap pairs need dynamic price precision.
+        const defaultFrom = Math.max(0, data.length - 120)
+        const defaultTo = data.length + 4
+        chart?.timeScale().setVisibleLogicalRange(savedRange ?? { from: defaultFrom, to: defaultTo })
         savedVisibleRange.current = null
         hasInitializedData.current = true
       } else if (visibleRange && prependCount > 0) {
@@ -224,6 +229,22 @@ export default function LiveChart({ data, marketKey = '', currentPrice = null, t
     }
     previousData.current = data
   }, [data, enabledIndicators])
+
+  useEffect(() => {
+    const positivePrices = data.flatMap(({ low, high, close }) => [low, high, close]).filter((value) => Number.isFinite(value) && value > 0)
+    const referencePrice = positivePrices.at(-1)
+    if (referencePrice === undefined) return
+    // Lightweight Charts defaults to cent precision, which compresses the
+    // vertical scale for coins priced below one cent and rounds their labels.
+    const precision = Math.min(8, Math.max(2, Math.floor(-Math.log10(referencePrice)) + 3))
+    const priceFormat = { type: 'price' as const, precision, minMove: 10 ** -precision }
+    seriesRef.current?.applyOptions({ priceFormat })
+    for (const [key, series] of indicatorSeries.current) {
+      if (/^(ema20|ema50|sma200|bollingerUpper|bollingerMiddle|bollingerLower|vwap|macd:(value|signal|histogram)|atr:value)$/.test(key)) {
+        series.applyOptions({ priceFormat })
+      }
+    }
+  }, [data])
 
   useEffect(() => {
     const chart = chartRef.current

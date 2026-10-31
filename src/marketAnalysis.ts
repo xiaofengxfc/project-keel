@@ -192,7 +192,7 @@ export function analyzeMultipleTimeframes(candlesByInterval: Partial<Record<Anal
 
 function calculateMarket(candles: AnalysisCandle[], livePrice: number | null): MarketAnalysis {
   const closed = candles.slice(0, -1)
-  const entry = livePrice ?? closed[closed.length - 1]?.close ?? null
+  const entry = closed[closed.length - 1]?.close ?? livePrice ?? null
   if (closed.length < 35 || entry === null || !Number.isFinite(entry) || entry <= 0) return noAnalysis(entry)
 
   const recent = closed.slice(-1000)
