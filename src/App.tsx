@@ -990,6 +990,12 @@ function App() {
 
   const cleanAiText = (value: string) => value.replace(/```[\s\S]*?```/g, '').replace(/^\s*[#*>`]+\s?/gm, '').replace(/\*+/g, '').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
 
+  const aiErrorText = (error: unknown) => {
+    const message = error instanceof Error ? error.message : ''
+    if (/abort|timeout|timed out/i.test(message)) return 'AI 服务响应超时，请稍后重试。'
+    return message || '请求失败，请检查 OpenAI 兼容接口配置。'
+  }
+
   const ask = async (requestedPrompt?: string) => {
     const prompt = (requestedPrompt ?? question).trim()
     if (!prompt || aiBusy || !health.aiConfigured) return
@@ -999,7 +1005,7 @@ function App() {
       const data = await response.json() as { answer?: string; error?: string }
       if (!response.ok) throw new Error(data.error ?? 'AI 服务不可用')
       setMessages((current) => [...current, `AI：${cleanAiText(data.answer ?? '没有得到有效回复。')}`])
-    } catch (error) { setMessages((current) => [...current, `AI：${error instanceof Error ? error.message : '请求失败，请检查 OpenAI 兼容接口配置。'}`]) }
+    } catch (error) { setMessages((current) => [...current, `AI：${aiErrorText(error)}`]) }
     finally { setAiBusy(false) }
   }
 

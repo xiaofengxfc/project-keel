@@ -18,6 +18,13 @@ const aiKey = process.env.OPENAI_API_KEY ?? ''
 const aiModel = process.env.OPENAI_MODEL ?? ''
 const aiBaseUrl = (process.env.OPENAI_API_BASE ?? process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, '')
 const aiChatUrl = aiBaseUrl.endsWith('/chat/completions') ? aiBaseUrl : `${aiBaseUrl}/chat/completions`
+// Reasoning models and compatible gateways can occasionally take longer than the
+// 30 second default used by AbortSignal.timeout. Keep the request alive long
+// enough for a normal completion, while allowing deployments to tune the limit.
+const configuredAiTimeoutMs = Number(process.env.OPENAI_TIMEOUT_MS ?? 120_000)
+const aiTimeoutMs = Number.isFinite(configuredAiTimeoutMs) && configuredAiTimeoutMs >= 10_000
+  ? Math.min(Math.round(configuredAiTimeoutMs), 300_000)
+  : 120_000
 let serverTimeOffsetMs = 0
 let serverTimeSyncAt = 0
 
@@ -517,7 +524,7 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
     const response = await fetch(aiChatUrl, {
       method: 'POST',
       headers,
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(aiTimeoutMs),
       body: JSON.stringify({
         model: aiModel,
         messages: [
@@ -531,6 +538,9 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
     if (!response.ok) return reply.code(502).send({ error: payload.error?.message ?? 'AI 服务请求失败' })
     return { answer: payload.choices?.[0]?.message?.content ?? '' }
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      return reply.code(504).send({ error: `AI 服务响应超时（${Math.round(aiTimeoutMs / 1000)} 秒），请稍后重试或检查模型服务。` })
+    }
     return reply.code(502).send({ error: error instanceof Error ? error.message : '无法连接 AI 服务' })
   }
 })
