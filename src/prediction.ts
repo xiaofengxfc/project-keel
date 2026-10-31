@@ -15,6 +15,7 @@ export type PredictionResult = {
   expectedLowPct: number | null
   expectedHighPct: number | null
   confidence: number
+  validation?: { accuracy?: number; brier?: number; coverage?: number; testSamples?: number }
 }
 
 export type PredictionAssessment = {
@@ -63,6 +64,14 @@ export function parsePrediction(value: unknown): PredictionResult | null {
     expectedLowPct: candidate.expectedLowPct === null ? null : Number(candidate.expectedLowPct),
     expectedHighPct: candidate.expectedHighPct === null ? null : Number(candidate.expectedHighPct),
     confidence: Number(candidate.confidence),
+    validation: candidate.validation && typeof candidate.validation === 'object'
+      ? {
+          accuracy: typeof candidate.validation.accuracy === 'number' ? candidate.validation.accuracy : undefined,
+          brier: typeof candidate.validation.brier === 'number' ? candidate.validation.brier : undefined,
+          coverage: typeof candidate.validation.coverage === 'number' ? candidate.validation.coverage : undefined,
+          testSamples: typeof candidate.validation.testSamples === 'number' ? candidate.validation.testSamples : undefined,
+        }
+      : undefined,
   }
 }
 

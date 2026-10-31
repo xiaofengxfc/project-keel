@@ -191,6 +191,7 @@ def predict(request: PredictionRequest) -> dict[str, Any]:
             "expectedLowPct": None,
             "expectedHighPct": None,
             "confidence": confidence,
+            "validation": bundle.metadata.get("metrics", {}),
         }
     except HTTPException:
         raise

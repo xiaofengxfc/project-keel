@@ -1052,7 +1052,7 @@ function App() {
           : prediction ? <>
             <div className="prediction-main"><b className={prediction.direction === 'UP' ? 'up' : prediction.direction === 'DOWN' ? 'down' : ''}>{prediction.direction === 'UP' ? '上涨' : prediction.direction === 'DOWN' ? '下跌' : '信号不足'}</b><span>未来 {prediction.horizonBars} 根 {prediction.interval} K 线</span><strong>置信度 {Math.round(prediction.confidence * 100)}%</strong></div>
             <div className="prediction-probabilities"><span>上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span>下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span>中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>
-            <small className="prediction-meta">模型 {prediction.version} · 数据截至 {new Date(prediction.dataThrough * 1000).toLocaleString()}</small>
+            <small className="prediction-meta">模型 {prediction.version} · 测试准确率 {prediction.validation?.accuracy === undefined ? '—' : `${Math.round(prediction.validation.accuracy * 100)}%`} · 数据截至 {new Date(prediction.dataThrough * 1000).toLocaleString()}</small>
           </> : <small className="prediction-muted">等待足够的已收盘 K 线。</small>}
   </div>
   const formatOrderTime = (value: number) => Number.isFinite(value) && value > 0 ? new Date(value).toLocaleString() : '—'
