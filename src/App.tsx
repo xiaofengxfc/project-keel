@@ -753,7 +753,8 @@ function App() {
       return { quantity, notional: Number(quantity) * price, inputAmount: amount }
     }
     const quantity = quantityFromAmount(amount, 'asset', 1, activeStepSize ?? '1')
-    return { quantity, notional: Number(quantity) * (last ?? 0), inputAmount: amount }
+    const price = orderPrice ? Number(orderPrice) : last
+    return { quantity, notional: Number(quantity) * (price ?? 0), inputAmount: amount }
   }, [active, activeSliderSize, activeStepSize, amountUnit, last, orderPercent, orderPrice, qty])
   const setLeverageForActiveSymbol = (value: number) => {
     setLeverageSelections((current) => ({ ...current, [active]: value }))
