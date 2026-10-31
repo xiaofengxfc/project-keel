@@ -55,7 +55,7 @@ async function binanceRequest<T>(method: string, path: string, params: Record<st
     query += `${query ? '&' : ''}signature=${crypto.createHmac('sha256', apiSecret).update(query).digest('hex')}`
     headers['X-MBX-APIKEY'] = apiKey
   }
-  const response = await fetch(`${baseUrl}${path}${query ? `?${query}` : ''}`, { method, headers })
+  const response = await fetch(`${baseUrl}${path}${query ? `?${query}` : ''}`, { method, headers, signal: AbortSignal.timeout(10000) })
   const body = await response.json() as T & { code?: number; msg?: string }
   if (!response.ok) throw new Error(`Binance ${body?.code ?? response.status}: ${body?.msg ?? response.statusText}`)
   return body
@@ -130,6 +130,7 @@ app.get('/api/market/exchange-info', async (_request, reply) => {
 })
 
 let cachedSymbols: { expiresAt: number; symbols: Array<{ symbol: string; baseAsset: string }> } | null = null
+const protectionLocks = new Map<string, Promise<void>>()
 
 app.get('/api/market/symbols', async (_request, reply) => {
   if (cachedSymbols && cachedSymbols.expiresAt > Date.now()) return cachedSymbols.symbols
@@ -332,6 +333,12 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
   if (!stopLossProvided && !takeProfitProvided) return reply.code(400).send({ error: '请至少提供一个需要更新或清除的保护价格' })
   if ([stopLoss, takeProfit].some((value) => value !== undefined && (!Number.isFinite(Number(value)) || Number(value) <= 0))) return reply.code(400).send({ error: '止盈止损价格必须大于 0' })
   if (!['MARK_PRICE', 'CONTRACT_PRICE'].includes(workingType)) return reply.code(400).send({ error: '触发参考价格无效' })
+  const lockKey = `${symbol}:${positionSide}`
+  const previousLock = protectionLocks.get(lockKey) ?? Promise.resolve()
+  let releaseLock!: () => void
+  const currentLock = new Promise<void>((resolve) => { releaseLock = resolve })
+  protectionLocks.set(lockKey, currentLock)
+  await previousLock
   try {
     const positions = await binanceRequest<Array<{ symbol: string; positionAmt: string; positionSide: string; markPrice: string }>>('GET', '/fapi/v2/positionRisk', { symbol }, true)
     const position = positions.find((row) => row.symbol === symbol && row.positionSide === positionSide && Number.isFinite(Number(row.positionAmt)) && Number(row.positionAmt) !== 0)
@@ -375,10 +382,18 @@ app.post<{ Body: { symbol?: string; positionSide?: string; side?: string; stopLo
       throw error
     }
     const oldOrdersToCancel = matchingProtectionOrders.filter((order) => order.type === 'STOP_MARKET' ? stopLossProvided : takeProfitProvided)
-    for (const order of oldOrdersToCancel) await binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true)
+    try {
+      for (const order of oldOrdersToCancel) await binanceRequest('DELETE', order.isAlgoOrder ? '/fapi/v1/algoOrder' : '/fapi/v1/order', order.isAlgoOrder ? { symbol, algoId: order.orderId } : { symbol, orderId: order.orderId }, true)
+    } catch (error) {
+      await Promise.allSettled(placed.map((order) => binanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: order.orderId }, true)))
+      throw new Error(`替换旧保护单失败，已撤销新保护单：${error instanceof Error ? error.message : '未知错误'}`)
+    }
     return { orders: placed, canceled: oldOrdersToCancel.length }
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? error.message : '设置止盈止损失败' })
+  } finally {
+    releaseLock()
+    if (protectionLocks.get(lockKey) === currentLock) protectionLocks.delete(lockKey)
   }
 })
 
@@ -452,6 +467,7 @@ app.post<{ Body: { question: string; context: { symbol: string; interval: string
     const response = await fetch(aiChatUrl, {
       method: 'POST',
       headers,
+      signal: AbortSignal.timeout(30000),
       body: JSON.stringify({
         model: aiModel,
         messages: [

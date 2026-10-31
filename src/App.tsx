@@ -429,10 +429,11 @@ function App() {
     retryAfterRef.current = 0
 
     const mergeCandles = (incoming: Candle[], replaceExisting = false) => {
-      if (!incoming.length || cancelled) return
+      const validIncoming = incoming.filter((candle) => Number.isFinite(candle.time) && candle.time > 0 && [candle.open, candle.high, candle.low, candle.close].every((value) => Number.isFinite(value) && value > 0) && Number.isFinite(candle.volume ?? 0) && (candle.volume ?? 0) >= 0 && candle.high >= Math.max(candle.open, candle.close, candle.low) && candle.low <= Math.min(candle.open, candle.close, candle.high))
+      if (!validIncoming.length || cancelled) return
       setCandles((current) => {
         const merged = new Map(current.map((candle) => [candle.time, candle]))
-        incoming.forEach((candle) => { if (replaceExisting || !merged.has(candle.time)) merged.set(candle.time, candle) })
+        validIncoming.forEach((candle) => { if (replaceExisting || !merged.has(candle.time)) merged.set(candle.time, candle) })
         return [...merged.values()].sort((left, right) => left.time - right.time)
       })
     }
