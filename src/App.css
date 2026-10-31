@@ -345,3 +345,27 @@
   border-radius:99px;
   background:#1b9a72;
 }
+
+
+/* Keep the range thumb centered on the six pixel rail across native browsers. */
+.binance-range,.leverage-range{
+  display:block;
+  height:18px;
+  margin:7px 0 3px;
+  vertical-align:middle;
+}
+.binance-range::-webkit-slider-runnable-track,.leverage-range::-webkit-slider-runnable-track{
+  height:6px;
+}
+.binance-range::-webkit-slider-thumb,.leverage-range::-webkit-slider-thumb{
+  width:18px;
+  height:18px;
+  margin-top:-6px;
+}
+.binance-range::-moz-range-track,.leverage-range::-moz-range-track{
+  height:6px;
+}
+.binance-range::-moz-range-thumb,.leverage-range::-moz-range-thumb{
+  width:12px;
+  height:12px;
+}

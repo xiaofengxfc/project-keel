@@ -214,7 +214,7 @@ function App() {
   const [side, setSide] = useState<'buy' | 'sell'>('buy')
   const [qty, setQty] = useState('0.01')
   const [amountUnit, setAmountUnit] = useState<OrderAmountUnit>('asset')
-  const [orderPercent, setOrderPercent] = useState(50)
+  const [orderPercent, setOrderPercent] = useState(0)
   const [orderType, setOrderType] = useState<BinanceOrderType>('LIMIT')
   const [orderPrice, setOrderPrice] = useState<string | null>(null)
   const [stopPrice, setStopPrice] = useState('')
@@ -257,7 +257,7 @@ function App() {
   const [manageStopLossChanged, setManageStopLossChanged] = useState(false)
   const [manageTakeProfitChanged, setManageTakeProfitChanged] = useState(false)
   const [manageQuantity, setManageQuantity] = useState('')
-  const [manageClosePercent, setManageClosePercent] = useState(50)
+  const [manageClosePercent, setManageClosePercent] = useState(0)
   const [manageMessage, setManageMessage] = useState('')
   const [manageBusy, setManageBusy] = useState(false)
   const [protectionMode, setProtectionMode] = useState<'program' | 'manual'>('program')
@@ -862,8 +862,8 @@ function App() {
     setManageTakeProfit(target ? String(target.stopPrice) : '')
     setManageStopLossChanged(false)
     setManageTakeProfitChanged(false)
-    setManageQuantity(partialCloseQuantity(position.positionAmt, 50, symbolRules[position.symbol]?.marketStepSize ?? symbolRules[position.symbol]?.stepSize ?? '1'))
-    setManageClosePercent(50)
+    setManageQuantity(partialCloseQuantity(position.positionAmt, 0, symbolRules[position.symbol]?.marketStepSize ?? symbolRules[position.symbol]?.stepSize ?? '1'))
+    setManageClosePercent(0)
     setManageMessage('')
   }
 
@@ -1056,7 +1056,7 @@ function App() {
         mobileOpen={mobileMarketsOpen}
         onCloseMobile={() => setMobileMarketsOpen(false)}
         onSearchChange={setSymbolSearch}
-        onSelect={(symbol) => { if (symbol !== active) { if (autoTimeframe) { setInterval('1h'); setAutoTimeframeReady(false) } setOrderPrice(null); setStopPrice(''); setActivationPrice(''); setClosePosition(false); setOrderPercent(50); setQty('0'); setLeverageBrackets([]); setLeverageBracketsSymbol(''); setCandles([]); setAnalysisCandlesByInterval({}); setChartIndicators((current) => ({ ...current })); setActive(symbol) } setMobileMarketsOpen(false) }}
+        onSelect={(symbol) => { if (symbol !== active) { if (autoTimeframe) { setInterval('1h'); setAutoTimeframeReady(false) } setOrderPrice(null); setStopPrice(''); setActivationPrice(''); setClosePosition(false); setOrderPercent(0); setQty('0'); setLeverageBrackets([]); setLeverageBracketsSymbol(''); setCandles([]); setAnalysisCandlesByInterval({}); setChartIndicators((current) => ({ ...current })); setActive(symbol) } setMobileMarketsOpen(false) }}
         onToggleFavorite={toggleFavorite}
         onMoveFavorite={moveFavorite}
         onReorder={(from, over) => setWatchlist((current) => reorderWatchlist(current, from, over))}
