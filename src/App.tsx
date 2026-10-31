@@ -13,6 +13,7 @@ type Tool = 'cursor' | 'horizontal' | 'trend'
 type Line = { id: number; price: number; label: string; color: string; deletable?: boolean }
 type Trend = { id: number; start: { time: number; price: number }; end: { time: number; price: number } }
 type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; predictionConfigured: boolean; environment?: string; websocketBaseUrl?: string }
+type TrainingStatus = { running: boolean; phase?: string; output?: string; error?: string | null; startedAt?: number; finishedAt?: number; interval?: Interval; symbols?: string[]; metrics?: { accuracy?: number; brier?: number; testSamples?: number } }
 type MarketQuote = { price: number; change: number }
 type Interval = '15m' | '1h' | '4h' | '1d'
 type MarketTransport = 'connecting' | 'websocket' | 'rest' | 'offline'
@@ -41,7 +42,11 @@ function formatPrice(value: number | null) {
 
 const KLINE_PAGE_SIZE = 1000
 const KLINE_REFRESH_MS: Record<Interval, number> = { '15m': 5_000, '1h': 8_000, '4h': 15_000, '1d': 15_000 }
-const KLINE_WATCHDOG_MS = 15_000
+// Binance can keep a stream open briefly without sending the selected kline
+// event. Use a longer watchdog and rely on any valid stream message to avoid
+// tearing down a healthy connection in a reconnect loop.
+const KLINE_WATCHDOG_MS = 45_000
+const WEBSOCKET_RECONNECT_COOLDOWN_MS = 120_000
 const klineCache = new Map<string, { rows: unknown[][]; fetchedAt: number }>()
 const klineRequests = new Map<string, Promise<unknown[][]>>()
 
@@ -260,6 +265,11 @@ function App() {
   const [predictionLoading, setPredictionLoading] = useState(false)
   const [predictionError, setPredictionError] = useState('')
   const predictionRequestKeyRef = useRef('')
+  const [trainingInterval, setTrainingInterval] = useState<Interval>('1h')
+  const [trainingSymbols, setTrainingSymbols] = useState('BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT')
+  const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ running: false })
+  const [trainingRequestError, setTrainingRequestError] = useState('')
+  const trainingStatusRequestInFlightRef = useRef(false)
   const historyRequestId = useRef(0)
   const tradingSettingsSymbol = useRef('')
   const tickerMessageAt = useRef<Record<string, number>>({})
@@ -393,10 +403,14 @@ function App() {
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     let watchdogTimer: number | undefined
+    let refreshInFlight = false
     let socket: WebSocket | null = null
     let reconnectAttempt = 0
     let lastKlineMessageAt = 0
+    let lastSocketMessageAt = 0
     let socketOpenedAt = 0
+    let socketStableTimer: ReturnType<typeof setTimeout> | undefined
+    let reconnectCooldownUntil = 0
     if (lastMarketKeyRef.current !== currentMarketKey) {
       lastMarketKeyRef.current = currentMarketKey
       setLoading(true)
@@ -424,16 +438,19 @@ function App() {
       })
     }
     const refreshLatestCandles = async () => {
+      if (cancelled || refreshInFlight) return
+      refreshInFlight = true
       try {
         const rows = await requestKlines(active, interval, undefined, 2, true)
         if (cancelled) return
         mergeCandles(parseKlines(rows), true)
-        const lastKlineAt = lastKlineMessageAt || socketOpenedAt
-        if (!lastKlineAt || Date.now() - lastKlineAt >= KLINE_WATCHDOG_MS) setMarketTransport('rest')
+        const lastSocketActivityAt = lastSocketMessageAt || lastKlineMessageAt || socketOpenedAt
+        if (!lastSocketActivityAt || Date.now() - lastSocketActivityAt >= KLINE_WATCHDOG_MS) setMarketTransport('rest')
       } catch {
-        const lastKlineAt = lastKlineMessageAt || socketOpenedAt
-        if (!cancelled && (!lastKlineAt || Date.now() - lastKlineAt >= KLINE_WATCHDOG_MS)) setMarketTransport('offline')
+        const lastSocketActivityAt = lastSocketMessageAt || lastKlineMessageAt || socketOpenedAt
+        if (!cancelled && (!lastSocketActivityAt || Date.now() - lastSocketActivityAt >= KLINE_WATCHDOG_MS)) setMarketTransport('offline')
       } finally {
+        refreshInFlight = false
         if (!cancelled) {
           if (refreshTimer) clearTimeout(refreshTimer)
           refreshTimer = setTimeout(refreshLatestCandles, KLINE_REFRESH_MS[interval])
@@ -453,12 +470,17 @@ function App() {
       if (cancelled || !streamUrl) return
       socket = new WebSocket(streamUrl)
       socket.onopen = () => {
-        reconnectAttempt = 0
         socketOpenedAt = Date.now()
         lastKlineMessageAt = 0
+        lastSocketMessageAt = socketOpenedAt
+        if (socketStableTimer) clearTimeout(socketStableTimer)
+        socketStableTimer = setTimeout(() => {
+          if (!cancelled && socket?.readyState === WebSocket.OPEN) reconnectAttempt = 0
+        }, KLINE_WATCHDOG_MS)
         if (!cancelled) setMarketTransport('connecting')
       }
       socket.onmessage = (event) => {
+        lastSocketMessageAt = Date.now()
         try {
           const envelope = JSON.parse(event.data) as { data?: { e?: string; s?: string; c?: string; P?: string; k?: { s?: string; i?: string; t: number; o: string; h: string; l: string; c: string; v?: string } }; s?: string; c?: string; P?: string; k?: { s?: string; i?: string; t: number; o: string; h: string; l: string; c: string; v?: string } }
           const data = (envelope.data ?? envelope) as typeof envelope
@@ -488,16 +510,21 @@ function App() {
         // 断线后先用强制 REST 请求补齐最近 K 线，再指数退避重连 WebSocket。
         if (refreshTimer) clearTimeout(refreshTimer)
         void refreshLatestCandles()
+        if (reconnectTimer) return
         reconnectAttempt += 1
-        const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempt, 5))
-        reconnectTimer = setTimeout(connect, delay)
+        const now = Date.now()
+        if (reconnectAttempt > 5) reconnectCooldownUntil = now + WEBSOCKET_RECONNECT_COOLDOWN_MS
+        const delay = reconnectCooldownUntil > now
+          ? reconnectCooldownUntil - now
+          : Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempt, 5))
+        reconnectTimer = setTimeout(() => { reconnectTimer = undefined; connect() }, delay)
       }
     }
     connect()
     void refreshLatestCandles()
     watchdogTimer = window.setInterval(() => {
-      const lastKlineAt = lastKlineMessageAt || socketOpenedAt
-      if (cancelled || !lastKlineAt || Date.now() - lastKlineAt < KLINE_WATCHDOG_MS) return
+      const lastSocketActivityAt = lastSocketMessageAt || socketOpenedAt
+      if (cancelled || !lastSocketActivityAt || Date.now() - lastSocketActivityAt < KLINE_WATCHDOG_MS) return
       setMarketTransport('rest')
       if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close()
     }, 3000)
@@ -505,6 +532,7 @@ function App() {
       cancelled = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
       if (refreshTimer) clearTimeout(refreshTimer)
+      if (socketStableTimer) clearTimeout(socketStableTimer)
       if (watchdogTimer) window.clearInterval(watchdogTimer)
       socket?.close()
       if (requestId === historyRequestId.current) historyRequestId.current += 1
@@ -749,7 +777,27 @@ function App() {
       }
     }).finally(() => { if (!cancelled) setPredictionLoading(false) })
     return () => { cancelled = true; controller.abort() }
-  }, [active, health.predictionConfigured, interval, predictionCandles.length, predictionDataThrough])
+  }, [active, health.predictionConfigured, interval, predictionCandles.length, predictionDataThrough, trainingStatus.finishedAt])
+  useEffect(() => {
+    let cancelled = false
+    const refreshTrainingStatus = async () => {
+      if (trainingStatusRequestInFlightRef.current) return
+      trainingStatusRequestInFlightRef.current = true
+      try {
+        const response = await fetch('/api/prediction/train/status', { cache: 'no-store' })
+        if (!response.ok) return
+        const status = await response.json() as TrainingStatus
+        if (!cancelled) {
+          setTrainingStatus(status)
+          if (!status.running && status.finishedAt) predictionRequestKeyRef.current = ''
+        }
+      } catch { /* Training status is optional until the local backend is ready. */ }
+      finally { trainingStatusRequestInFlightRef.current = false }
+    }
+    void refreshTrainingStatus()
+    const timer = window.setInterval(() => { if (trainingStatus.running) void refreshTrainingStatus() }, 1500)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [trainingStatus.running])
   const chartIndicatorValues = useMemo(() => calculateTechnicalIndicators(chartCandles), [chartCandles])
   const activeQuoteAsset = quoteAsset(active)
   const displayedAmountUnitLabel = amountUnit === 'asset' ? active.replace(activeQuoteAsset, '') : activeQuoteAsset
@@ -1030,6 +1078,30 @@ function App() {
     return message || '请求失败，请检查 OpenAI 兼容接口配置。'
   }
 
+  const startModelTraining = async () => {
+    if (trainingStatus.running) return
+    const symbols = [...new Set(trainingSymbols.split(',').map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))]
+    if (symbols.length < 2 || symbols.length > 30 || symbols.some((symbol) => !/^[A-Z0-9]{3,20}$/.test(symbol))) {
+      setTrainingRequestError('请输入 2 到 30 个有效交易对，并用逗号分隔。')
+      return
+    }
+    setTrainingRequestError('')
+    setTrainingStatus({ running: true, phase: '正在提交训练任务…', interval: trainingInterval, symbols })
+    try {
+      const response = await fetch('/api/prediction/train', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interval: trainingInterval, symbols }),
+      })
+      const payload = await response.json() as TrainingStatus & { error?: string }
+      if (!response.ok) throw new Error(payload.error ?? '无法启动模型训练')
+      setTrainingStatus(payload)
+    } catch (error) {
+      setTrainingStatus({ running: false, error: error instanceof Error ? error.message : '模型训练启动失败', interval: trainingInterval, symbols })
+      setTrainingRequestError(error instanceof Error ? error.message : '模型训练启动失败')
+    }
+  }
+
   const ask = async (requestedPrompt?: string) => {
     const prompt = (requestedPrompt ?? question).trim()
     if (!prompt || aiBusy || !health.aiConfigured) return
@@ -1059,6 +1131,20 @@ function App() {
             <div className="prediction-probabilities"><span>上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span>下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span>中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>
             <small className="prediction-meta">模型 {prediction.version} · 测试准确率 {prediction.validation?.accuracy === undefined ? '—' : `${Math.round(prediction.validation.accuracy * 100)}%`} · 数据截至 {new Date(prediction.dataThrough * 1000).toLocaleString()}</small>
           </> : <small className="prediction-muted">等待足够的已收盘 K 线。</small>}
+    <div className="prediction-training">
+      <div className="prediction-training-heading"><strong>训练通用模型</strong><small>训练产物保存在本地</small></div>
+      <small className="prediction-training-note">使用多个币种的历史 K 线训练同一个方向模型；仅当验证结果达标时才更新模型。</small>
+      <div className="prediction-training-fields">
+        <label>周期<select value={trainingInterval} onChange={(event) => setTrainingInterval(event.target.value as Interval)} disabled={trainingStatus.running}><option value="15m">15 分钟</option><option value="1h">1 小时</option><option value="4h">4 小时</option><option value="1d">1 天</option></select></label>
+        <label>交易对（逗号分隔）<input value={trainingSymbols} onChange={(event) => setTrainingSymbols(event.target.value)} disabled={trainingStatus.running} placeholder="BTCUSDT,ETHUSDT,BNBUSDT" /></label>
+      </div>
+      <button type="button" className="prediction-training-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running}>{trainingStatus.running ? '模型训练中…' : '开始训练'}</button>
+      {(trainingRequestError || trainingStatus.error) && <small className="prediction-training-error" role="alert">{trainingRequestError || trainingStatus.error}</small>}
+      {trainingStatus.running && <div className="prediction-training-state" role="status"><i />正在训练 {trainingStatus.interval ?? trainingInterval} 通用模型 · {trainingStatus.symbols?.join(', ') ?? '正在提交任务'}</div>}
+      {trainingStatus.phase === 'completed' && <div className="prediction-training-result" role="status"><strong>训练完成，模型已保存</strong><span>验证准确率 {trainingStatus.metrics?.accuracy === undefined ? '—' : `${(trainingStatus.metrics.accuracy * 100).toFixed(1)}%`} · Brier {trainingStatus.metrics?.brier === undefined ? '—' : trainingStatus.metrics.brier.toFixed(4)} · 测试样本 {trainingStatus.metrics?.testSamples?.toLocaleString() ?? '—'}</span></div>}
+      {trainingStatus.phase === 'failed' && <div className="prediction-training-failed" role="status">训练未完成</div>}
+      {trainingStatus.output && <details className="prediction-training-log"><summary>训练日志</summary><pre>{trainingStatus.output}</pre></details>}
+    </div>
   </div>
   const formatOrderTime = (value: number) => Number.isFinite(value) && value > 0 ? new Date(value).toLocaleString() : '—'
   const formatOrderPrice = (order: OrderRow) => order.price > 0 && order.stopPrice > 0 ? `${formatPrice(order.price)} / 触发 ${formatPrice(order.stopPrice)}` : order.price > 0 ? formatPrice(order.price) : order.stopPrice > 0 ? `触发 ${formatPrice(order.stopPrice)}` : '市价'
