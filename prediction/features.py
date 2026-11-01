@@ -190,6 +190,70 @@ def feature_row(candles: Sequence[Candle]) -> list[float]:
     return values
 
 
+def _feature_row_at(candles: Sequence[Candle], end_index: int) -> tuple[list[float], float]:
+    """Build one training row without copying the full candle prefix.
+
+    Training rows are chronological prefixes of one symbol's candles.  The
+    regular :func:`feature_row` API accepts a standalone sequence and is kept
+    for live inference, but slicing ``candles[:index + 1]`` for every training
+    row turns feature generation into quadratic work.  This helper computes
+    the same bounded-window values directly against the original sequence.
+    """
+    if end_index < 49 or end_index >= len(candles):
+        raise ValueError("at least 50 closed candles are required")
+    latest = candles[end_index]
+    close = latest.close
+    safe_close = max(close, 1e-12)
+    returns = [close / candles[end_index - period].close - 1.0 for period in (1, 3, 5, 10, 20)]
+    candle_range = max(latest.high - latest.low, 0.0)
+    body = abs(latest.close - latest.open)
+    upper_wick = max(latest.high - max(latest.open, latest.close), 0.0)
+    lower_wick = max(min(latest.open, latest.close) - latest.low, 0.0)
+    closes_200 = [candles[index].close for index in range(max(0, end_index - 199), end_index + 1)]
+    closes_400 = [candles[index].close for index in range(max(0, end_index - 399), end_index + 1)]
+    ema20 = _ema(closes_200, 20)
+    ema50 = _ema(closes_400, 50)
+    # Include the candle immediately before the 14-candle ATR window because
+    # _atr uses it as the previous close for the first true range value.
+    atr = _atr(candles[max(0, end_index - 14):end_index + 1], 14)
+    volumes = [candles[index].volume for index in range(max(0, end_index - 20), end_index + 1)]
+    average_volume = sum(volumes[-20:]) / min(20, len(volumes))
+    prior_volumes = volumes[:-1]
+    prior_volume_mean = sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    prior_volume_variance = sum((value - prior_volume_mean) ** 2 for value in prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
+    prior_volume_std = prior_volume_variance ** 0.5
+    returns_20 = [candles[index].close / candles[index - 1].close - 1.0 for index in range(max(1, end_index - 19), end_index + 1)]
+    returns_50 = [candles[index].close / candles[index - 1].close - 1.0 for index in range(max(1, end_index - 49), end_index + 1)]
+    volatility_20 = (sum((value - sum(returns_20) / len(returns_20)) ** 2 for value in returns_20) / len(returns_20)) ** 0.5 if returns_20 else 0.0
+    volatility_50 = (sum((value - sum(returns_50) / len(returns_50)) ** 2 for value in returns_50) / len(returns_50)) ** 0.5 if returns_50 else 0.0
+    rolling_range_pct20 = sum((candles[index].high - candles[index].low) / max(candles[index].close, 1e-12) for index in range(max(0, end_index - 19), end_index + 1)) / min(20, end_index + 1)
+    movement = sum(abs(candles[index].close - candles[index - 1].close) for index in range(max(1, end_index - 19), end_index + 1))
+    net_movement = abs(close - candles[max(0, end_index - 20)].close)
+    values = [
+        *returns,
+        candle_range / safe_close,
+        body / safe_close,
+        upper_wick / safe_close,
+        lower_wick / safe_close,
+        (close - ema20) / safe_close,
+        (close - ema50) / safe_close,
+        _rsi(closes_200),
+        atr / safe_close,
+        latest.volume / average_volume if average_volume > 0 else 1.0,
+        volumes[-1] / max(volumes[-6], 1e-12) - 1.0,
+        net_movement / movement if movement > 0 else 0.0,
+        close / candles[end_index - 50].close - 1.0 if end_index + 1 > 50 else 0.0,
+        volatility_20,
+        volatility_50,
+        rolling_range_pct20,
+        (latest.volume - prior_volume_mean) / prior_volume_std if prior_volume_std > 1e-12 else 0.0,
+        returns[-3] - returns[-1] if len(returns) >= 5 else 0.0,
+    ]
+    if len(values) != len(FEATURE_NAMES) or not all(isfinite(value) for value in values):
+        raise ValueError("feature extraction produced a non-finite value")
+    return values, atr
+
+
 def build_training_rows(candles: Sequence[Candle], horizon_bars: int, neutral_threshold: float = 0.0015) -> tuple[list[list[float]], list[int], list[float]]:
     """Build time-ordered feature rows and 0=DOWN/1=NEUTRAL/2=UP labels."""
     if horizon_bars < 1:
@@ -200,10 +264,9 @@ def build_training_rows(candles: Sequence[Candle], horizon_bars: int, neutral_th
     labels: list[int] = []
     returns: list[float] = []
     for index in range(49, len(candles) - horizon_bars):
-        window = candles[: index + 1]
-        row = feature_row(window)
+        row, atr = _feature_row_at(candles, index)
         future_return = candles[index + horizon_bars].close / candles[index].close - 1.0
-        threshold = max(neutral_threshold, _atr(window, 14) / candles[index].close * 0.25)
+        threshold = max(neutral_threshold, atr / candles[index].close * 0.25)
         label = 2 if future_return > threshold else 0 if future_return < -threshold else 1
         features.append(row)
         labels.append(label)

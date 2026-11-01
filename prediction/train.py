@@ -178,8 +178,18 @@ def main() -> None:
         symbol = "*"
     training_rows: list[tuple[float, float, list[float], int, float]] = []
     source_candles: list[Candle] = []
-    for input_path in input_paths:
+    for input_index, input_path in enumerate(input_paths, start=1):
         candles = drop_open_candle(read_csv(input_path), args.interval)
+        report_progress(
+            "preparing",
+            interval=args.interval,
+            currentSymbol=inferred_symbols[input_index - 1],
+            symbolIndex=input_index,
+            symbolCount=len(input_paths),
+            pagesFetched=0,
+            rowsFetched=0,
+            message=f"正在为 {inferred_symbols[input_index - 1]} 构造训练特征",
+        )
         features_for_symbol, labels_for_symbol, returns_for_symbol = build_training_rows(candles, args.horizon_bars, args.neutral_threshold)
         source_candles.extend(candles)
         row_times = [candles[index].time for index in range(49, len(candles) - args.horizon_bars)]
@@ -194,7 +204,7 @@ def main() -> None:
     returns = [row[4] for row in training_rows]
     if len(features) < 120:
         parser.error(f"有效训练样本只有 {len(features)} 条，至少需要 120 条")
-    report_progress("training", interval=args.interval, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message=f"已准备 {len(features)} 条训练样本，开始拟合模型")
+    report_progress("fitting", interval=args.interval, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message=f"已准备 {len(features)} 条训练样本，开始拟合模型")
     try:
         import numpy as np
         import lightgbm as lgb

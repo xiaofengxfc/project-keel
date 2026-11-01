@@ -1314,8 +1314,13 @@ function App() {
   const statusIntervals = trainingStatus.intervals?.length ? trainingStatus.intervals : trainingIntervals
   const intervalResults = trainingStatus.intervalResults ?? trainingStatus.results ?? {}
   const trainingBadgeLabel = trainingStatus.running ? '训练中' : trainingStatus.phase === 'partial' ? '部分完成' : trainingStatus.phase === 'completed' ? '已完成' : trainingStatus.phase === 'not-promoted' ? '未晋级' : trainingStatus.phase === 'stopped' ? '已停止' : trainingStatus.phase === 'failed' ? '未完成' : '等待训练'
-  const stageLabels: Record<string, string> = { starting: '正在准备任务', collecting: '正在采集历史 K 线', training: '正在训练模型', validating: '正在评估候选模型', exporting: '正在导出模型文件', promoting: '正在保存并加载模型', stopping: '正在停止训练', 'not-promoted': '候选模型未晋级', completed: '当前周期已完成', failed: '当前周期失败', stopped: '训练已停止', interrupted: '训练进程已中断', finished: '任务已结束' }
+  const stageLabels: Record<string, string> = { starting: '正在准备任务', collecting: '正在采集历史 K 线', preparing: '正在准备训练特征', fitting: '正在拟合候选模型', training: '正在训练模型', validating: '正在评估候选模型', exporting: '正在导出模型文件', promoting: '正在保存并加载模型', stopping: '正在停止训练', 'not-promoted': '候选模型未晋级', completed: '当前周期已完成', failed: '当前周期失败', stopped: '训练已停止', interrupted: '训练进程已中断', finished: '任务已结束' }
   const trainingStageLabel = trainingStatus.stage ? stageLabels[trainingStatus.stage] ?? trainingStatus.stage : (trainingStatus.phase === 'running' ? '任务正在运行' : '')
+  const trainingDataProgress = trainingStatus.stage === 'fitting'
+    ? `已准备 ${trainingStatus.rowsFetched ?? 0} 条训练样本`
+    : trainingStatus.stage === 'preparing'
+      ? '正在构造训练特征'
+      : `已获取 ${trainingStatus.rowsFetched ?? 0} 根 K 线`
   const intervalResultPhase = (result: TrainingIntervalResult | undefined) => result?.status ?? result?.phase
   const resultStatusLabel = (result: TrainingIntervalResult | undefined, value: Interval) => {
     const phase = intervalResultPhase(result)
@@ -1350,7 +1355,7 @@ function App() {
       </section>
       <section className="training-run-card">
         <div className="training-section-heading"><span>02</span><div><h2>训练进度与结果</h2><p>训练完成后会自动验证并尝试热加载</p></div></div>
-        {trainingStatus.running ? <div className="training-progress" role="status"><i /><div><strong>{trainingStatus.currentInterval ? `正在处理 ${trainingStatus.currentInterval} 周期模型` : '正在准备训练任务'}</strong><span>{trainingStageLabel}{trainingStatus.currentSymbol ? ` · 当前币种 ${trainingStatus.currentSymbol}` : ''}</span>{trainingStatus.symbolCount !== undefined && <span>币种进度：{trainingStatus.symbolIndex ?? 0}/{trainingStatus.symbolCount} · 已获取 {trainingStatus.rowsFetched ?? 0} 根 K 线</span>}<span>{trainingStatus.symbols?.length ? `训练币种：${trainingStatus.symbols.join(' · ')}` : '正在随机选取币种'}</span><span>周期进度：{trainingStatus.finishedIntervals?.length ?? trainingStatus.completedIntervals?.length ?? 0}/{statusIntervals.length} 已结束 · {trainingStatus.completedIntervals?.length ?? 0} 个已晋级</span></div></div>
+        {trainingStatus.running ? <div className="training-progress" role="status"><i /><div><strong>{trainingStatus.currentInterval ? `正在处理 ${trainingStatus.currentInterval} 周期模型` : '正在准备训练任务'}</strong><span>{trainingStageLabel}{trainingStatus.currentSymbol ? ` · 当前币种 ${trainingStatus.currentSymbol}` : ''}</span>{trainingStatus.symbolCount !== undefined && <span>币种进度：{trainingStatus.symbolIndex ?? 0}/{trainingStatus.symbolCount} · {trainingDataProgress}</span>}<span>{trainingStatus.symbols?.length ? `训练币种：${trainingStatus.symbols.join(' · ')}` : '正在随机选取币种'}</span><span>周期进度：{trainingStatus.finishedIntervals?.length ?? trainingStatus.completedIntervals?.length ?? 0}/{statusIntervals.length} 已结束 · {trainingStatus.completedIntervals?.length ?? 0} 个已晋级</span></div></div>
           : trainingStatus.phase === 'completed' ? <div className="training-page-result" role="status"><strong>所选周期训练任务已结束</strong><small>每个周期的验证和模型晋级结果如下。</small></div>
             : trainingStatus.phase === 'not-promoted' ? <div className="training-idle failed" role="status">训练已完成，但候选模型未能晋级；现有模型保持不变。请查看周期结果与评估指标。</div>
             : trainingStatus.phase === 'partial' ? <div className="training-idle failed" role="status">部分周期已完成，至少一个周期失败或未能晋级；请查看各周期结果与日志。</div>

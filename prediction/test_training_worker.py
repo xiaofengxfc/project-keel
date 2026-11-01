@@ -184,6 +184,32 @@ class TrainingWorkerTests(unittest.TestCase):
             self.assertEqual(state["rowsFetched"], 100)
             self.assertEqual(state["pagesFetched"], 1)
 
+    def test_worker_resets_collection_counter_before_training_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            progress_path = root / "progress.json"
+            log_path = root / "training.log"
+            state = {"jobId": "job-1", "intervalResults": {}}
+            lines = [
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 1, "rowsFetched": 100, "pagesFetched": 1}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 2, "rowsFetched": 200, "pagesFetched": 2}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "preparing", "symbolIndex": 2, "rowsFetched": 1234, "pagesFetched": 0}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "fitting", "symbolIndex": 2, "rowsFetched": 1234, "pagesFetched": 0}),
+            ]
+
+            class FakeProcess:
+                stdout = iter(f"{line}\n" for line in lines)
+
+                def wait(self):
+                    return 1
+
+            with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
+                run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+
+            self.assertEqual(state["rowsFetched"], 1234)
+            self.assertEqual(state["pagesFetched"], 0)
+
     def test_worker_preserves_machine_readable_child_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -225,7 +251,7 @@ class TrainingWorkerTests(unittest.TestCase):
                         "error": "第一次采集失败",
                     }) + "\n",
                     "KEEL_TRAIN_PROGRESS " + json.dumps({
-                        "jobId": "job-1", "phase": "collecting",
+                        "jobId": "job-1", "phase": "preparing",
                     }) + "\n",
                     "RuntimeError: 第二次采集失败\n",
                 ])

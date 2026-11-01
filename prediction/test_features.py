@@ -1,6 +1,6 @@
 import unittest
 
-from prediction.features import FEATURE_NAMES, build_training_rows, feature_row, normalize_candles
+from prediction.features import FEATURE_NAMES, _feature_row_at, build_training_rows, feature_row, normalize_candles
 from prediction.train import purged_time_splits
 
 
@@ -30,6 +30,18 @@ class FeatureTests(unittest.TestCase):
         self.assertTrue({"return_50", "realized_volatility20", "realized_volatility50", "rolling_range_pct20", "volume_zscore20", "trend_momentum_5_20"}.issubset(FEATURE_NAMES))
         features, _, _ = build_training_rows(candles, 3)
         self.assertEqual(len(features[-1]), len(FEATURE_NAMES))
+
+    def test_training_rows_match_prefix_feature_rows(self):
+        candles = normalize_candles(sample_candles(140))
+        features, labels, returns = build_training_rows(candles, 3)
+        for row_number, index in enumerate(range(49, len(candles) - 3)):
+            expected = feature_row(candles[:index + 1])
+            actual, _ = _feature_row_at(candles, index)
+            for expected_value, actual_value in zip(expected, actual):
+                self.assertAlmostEqual(expected_value, actual_value, places=15)
+            expected_return = candles[index + 3].close / candles[index].close - 1.0
+            self.assertAlmostEqual(returns[row_number], expected_return, places=15)
+            self.assertEqual(len(labels), len(features))
 
     def test_purged_chronological_folds_prevent_horizon_label_overlap(self):
         row_times = list(range(30))

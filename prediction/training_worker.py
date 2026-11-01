@@ -219,6 +219,7 @@ def run_interval(
     progress_pages_current = 0
     progress_rows_completed = 0
     progress_pages_completed = 0
+    progress_phase: str | None = None
     last_progress_error: str | None = None
     for raw_line in process.stdout:
         line = raw_line.rstrip("\r\n")
@@ -239,10 +240,21 @@ def run_interval(
         if not progress:
             progress = load_progress(progress_path, job_id)
         if progress:
+            incoming_phase = progress.get("phase")
+            if isinstance(incoming_phase, str) and incoming_phase != progress_phase:
+                # Candle collection and feature/model stages use different
+                # counters. Do not carry a per-symbol collection counter into
+                # the later training phases.
+                progress_phase = incoming_phase
+                progress_symbol_index = None
+                progress_rows_current = 0
+                progress_pages_current = 0
+                progress_rows_completed = 0
+                progress_pages_completed = 0
             if progress.get("phase") == "failed":
                 if isinstance(progress.get("error"), str) and progress["error"].strip():
                     last_progress_error = progress["error"].strip()
-            elif progress.get("phase") in {"collecting", "training", "validating", "promoting"}:
+            elif progress.get("phase") in {"collecting", "preparing", "fitting", "training", "validating", "exporting", "promoting"}:
                 last_progress_error = None
             incoming_symbol_index = progress.get("symbolIndex")
             if isinstance(incoming_symbol_index, int):

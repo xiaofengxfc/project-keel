@@ -204,7 +204,7 @@ def main() -> None:
             "--horizon-bars", os.getenv("PREDICTION_HORIZON_BARS", "3"),
             "--output-dir", str(candidate),
         ]
-        report_progress("training", interval=args.interval, currentSymbol=None, symbolIndex=len(symbols), symbolCount=len(symbols), message="K 线采集完成，开始训练候选模型")
+        report_progress("preparing", interval=args.interval, currentSymbol=None, symbolIndex=len(symbols), symbolCount=len(symbols), message="K 线采集完成，开始准备训练特征")
         if (target / "direction.txt").is_file() and (target / "metadata.json").is_file():
             train_args.extend(["--baseline-model-dir", str(target)])
         run_module("prediction.train", train_args)
