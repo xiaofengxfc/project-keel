@@ -1274,7 +1274,11 @@ function App() {
     setTrainingStopInFlight(true)
     setTrainingStatusError('')
     try {
-      const response = await fetch('/api/prediction/train/stop', { method: 'POST' })
+      const response = await fetch('/api/prediction/train/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
       const payload = await response.json() as TrainingStatus & { error?: string }
       if (!response.ok) throw new Error(payload.error ?? '无法停止模型训练')
       setTrainingStatus(payload)
