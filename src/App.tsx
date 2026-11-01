@@ -56,9 +56,10 @@ function formatPrice(value: number | null) {
 const KLINE_PAGE_SIZE = 1000
 const KLINE_REFRESH_MS: Record<Interval, number> = { '15m': 5_000, '1h': 8_000, '4h': 15_000, '1d': 15_000 }
 // Binance can keep a stream open briefly without sending the selected kline
-// event. Use a longer watchdog and rely on any valid stream message to avoid
-// tearing down a healthy connection in a reconnect loop.
+// event. Use a longer watchdog and only reconnect when the selected kline
+// stream itself has gone stale.
 const KLINE_WATCHDOG_MS = 45_000
+const WEBSOCKET_CONNECT_TIMEOUT_MS = 12_000
 const WEBSOCKET_RECONNECT_COOLDOWN_MS = 120_000
 const MAX_AI_DISPLAY_CHARACTERS = 4500
 const klineCache = new Map<string, { rows: unknown[][]; fetchedAt: number }>()
@@ -454,7 +455,7 @@ function App() {
     let reconnectAttempt = 0
     let lastKlineMessageAt = 0
     let socketOpenedAt = 0
-    let socketStableTimer: ReturnType<typeof setTimeout> | undefined
+    let socketConnectTimer: ReturnType<typeof setTimeout> | undefined
     let reconnectCooldownUntil = 0
     if (lastMarketKeyRef.current !== currentMarketKey) {
       lastMarketKeyRef.current = currentMarketKey
@@ -499,11 +500,11 @@ function App() {
         const rows = await requestKlines(active, interval, undefined, 2, true)
         if (cancelled) return
         mergeCandles(parseKlines(rows), true)
-        const lastKlineActivityAt = lastKlineMessageAt || socketOpenedAt
-        if (!lastKlineActivityAt || Date.now() - lastKlineActivityAt >= KLINE_WATCHDOG_MS) setMarketTransport('rest')
+        const streamHealthy = socket?.readyState === WebSocket.OPEN && lastKlineMessageAt > 0 && Date.now() - lastKlineMessageAt < KLINE_WATCHDOG_MS
+        if (!streamHealthy) setMarketTransport('rest')
       } catch {
-        const lastKlineActivityAt = lastKlineMessageAt || socketOpenedAt
-        if (!cancelled && (!lastKlineActivityAt || Date.now() - lastKlineActivityAt >= KLINE_WATCHDOG_MS)) setMarketTransport('offline')
+        const streamHealthy = socket?.readyState === WebSocket.OPEN && lastKlineMessageAt > 0 && Date.now() - lastKlineMessageAt < KLINE_WATCHDOG_MS
+        if (!cancelled && !streamHealthy) setMarketTransport('offline')
       } finally {
         refreshInFlight = false
         if (!cancelled) {
@@ -527,14 +528,21 @@ function App() {
     const connect = () => {
       if (cancelled || !streamUrl) return
       socket = new WebSocket(streamUrl)
+      const currentSocket = socket
+      if (socketConnectTimer) clearTimeout(socketConnectTimer)
+      socketConnectTimer = setTimeout(() => {
+        if (cancelled || socket !== currentSocket || currentSocket.readyState !== WebSocket.CONNECTING) return
+        setMarketTransport('rest')
+        currentSocket.close()
+      }, WEBSOCKET_CONNECT_TIMEOUT_MS)
       socket.onopen = () => {
+        if (socketConnectTimer) {
+          clearTimeout(socketConnectTimer)
+          socketConnectTimer = undefined
+        }
         socketOpenedAt = Date.now()
         lastKlineMessageAt = 0
-        if (socketStableTimer) clearTimeout(socketStableTimer)
-        socketStableTimer = setTimeout(() => {
-          if (!cancelled && socket?.readyState === WebSocket.OPEN) reconnectAttempt = 0
-        }, KLINE_WATCHDOG_MS)
-        if (!cancelled) setMarketTransport('connecting')
+        if (!cancelled) setMarketTransport('websocket')
       }
       socket.onmessage = (event) => {
         try {
@@ -548,6 +556,8 @@ function App() {
               clearTimeout(refreshTimer)
               refreshTimer = undefined
             }
+            reconnectAttempt = 0
+            reconnectCooldownUntil = 0
             if (!cancelled) {
               setMarketTransport('websocket')
             }
@@ -563,9 +573,13 @@ function App() {
           }
         } catch { /* 忽略无法解析的行情消息，等待下一条推送。 */ }
       }
-      socket.onerror = () => { if (!cancelled) setMarketTransport('rest') }
+      socket.onerror = () => { if (!cancelled && socket === currentSocket) setMarketTransport('rest') }
       socket.onclose = () => {
-        if (cancelled) return
+        if (cancelled || socket !== currentSocket) return
+        if (socketConnectTimer) {
+          clearTimeout(socketConnectTimer)
+          socketConnectTimer = undefined
+        }
         setMarketTransport('rest')
         // 断线后先用强制 REST 请求补齐最近 K 线，再指数退避重连 WebSocket。
         if (refreshTimer) clearTimeout(refreshTimer)
@@ -592,7 +606,7 @@ function App() {
       cancelled = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
       if (refreshTimer) clearTimeout(refreshTimer)
-      if (socketStableTimer) clearTimeout(socketStableTimer)
+      if (socketConnectTimer) clearTimeout(socketConnectTimer)
       if (watchdogTimer) window.clearInterval(watchdogTimer)
       socket?.close()
       if (requestId === historyRequestId.current) historyRequestId.current += 1
