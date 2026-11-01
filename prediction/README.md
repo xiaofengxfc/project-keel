@@ -41,6 +41,8 @@ python -m prediction.service
 
 服务默认监听 `127.0.0.1:8790`。没有模型文件或 ONNX 运行时不可用时，`/health` 会返回 `ready:false`，`/predict` 返回 503；前端会明确显示预测不可用，不会生成替代性的自动交易结论。
 
+通过项目 Node 后端启动时，`PREDICTION_ENABLED=true` 且 `PREDICTION_SERVICE_URL` 使用本机地址会自动启动这个服务，并继承 `.env` 中的 `PREDICTION_PYTHON`、`PREDICTION_HOST`、`PREDICTION_PORT` 和模型目录配置。只有单独运行 Python 服务或把预测地址配置为外部服务时，才需要手动启动或管理预测服务。
+
 请求示例：
 
 ```json

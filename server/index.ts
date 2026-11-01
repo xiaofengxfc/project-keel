@@ -69,6 +69,61 @@ const predictionTimeoutMs = Number.isFinite(configuredPredictionTimeoutMs) && co
 const predictionDispatcher = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost)(?::|\/)/i.test(predictionServiceUrl) ? new Agent() : undefined
 let serverTimeOffsetMs = 0
 let serverTimeSyncAt = 0
+let predictionServiceProcess: ChildProcess | null = null
+
+function localPredictionHealthUrl(): URL | null {
+  try {
+    const parsed = new URL(predictionServiceUrl)
+    if (!['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname)) return null
+    return new URL('/health', parsed)
+  } catch {
+    return null
+  }
+}
+
+async function ensureLocalPredictionService(): Promise<void> {
+  const healthUrl = localPredictionHealthUrl()
+  if (!predictionEnabled || !healthUrl) return
+  try {
+    const response = await fetch(healthUrl, {
+      signal: AbortSignal.timeout(1_000),
+      ...(predictionDispatcher ? { dispatcher: predictionDispatcher } : {}),
+    })
+    if (response.ok) return
+  } catch {
+    // The local service may not be started yet; launch it below.
+  }
+
+  const configuredPythonPath = process.env.PREDICTION_PYTHON?.trim()
+  const virtualenvPython = resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  const virtualenvPythonw = resolve('.venv', process.platform === 'win32' ? 'Scripts/pythonw.exe' : 'bin/python')
+  const pythonPath = configuredPythonPath
+    || (process.platform === 'win32' && existsSync(virtualenvPythonw) ? virtualenvPythonw : existsSync(virtualenvPython) ? virtualenvPython : process.platform === 'win32' ? 'pythonw' : 'python')
+  try {
+    const child = spawn(pythonPath, ['-u', '-m', 'prediction.service'], {
+      cwd: process.cwd(),
+      windowsHide: true,
+      env: { ...process.env },
+      stdio: 'ignore',
+    })
+    predictionServiceProcess = child
+    child.once('error', (error) => {
+      app.log.error({ err: error }, '无法启动本地预测服务')
+      if (predictionServiceProcess === child) predictionServiceProcess = null
+    })
+    child.once('exit', (code, signal) => {
+      if (code !== 0 && signal !== 'SIGTERM') app.log.error({ code, signal }, '本地预测服务已退出')
+      if (predictionServiceProcess === child) predictionServiceProcess = null
+    })
+    child.unref()
+    process.once('exit', () => {
+      if (child.pid) child.kill()
+    })
+    app.log.info({ pythonPath, healthUrl: healthUrl.toString() }, '已启动本地预测服务')
+  } catch (error) {
+    app.log.error({ err: error }, '无法启动本地预测服务')
+  }
+}
 
 async function syncBinanceServerTime(force = false) {
   if (!force && Date.now() - serverTimeSyncAt < 60_000) return serverTimeOffsetMs
@@ -1039,6 +1094,8 @@ app.delete<{ Querystring: { symbol?: string; orderId?: string; algoId?: string }
     return reply.code(502).send({ error: error instanceof Error ? error.message : '撤单被拒绝' })
   }
 })
+
+await ensureLocalPredictionService()
 
 app.listen({ port: Number(process.env.PORT ?? 8788), host: '127.0.0.1' }).catch((error) => {
   app.log.error(error)

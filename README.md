@@ -80,6 +80,8 @@ $env:PREDICTION_MODEL_DIR = "prediction\models"
 python -m prediction.service
 ```
 
+使用项目的 Node 后端启动时，只要 `PREDICTION_ENABLED=true` 且 `PREDICTION_SERVICE_URL` 指向本机地址，后端会根据 `.env` 中的 Python 配置自动启动本地预测服务；只有单独运行 Python 服务或使用外部预测地址时，才需要手动执行上面的命令。
+
 通用模型可以由 `prediction.auto_train` 定期重训练。它会合并多个交易对的数据，只在候选模型通过指标门槛且不劣于当前模型时替换，并保留上一版本回滚。
 
 再在 `.env` 中启用后端代理：
