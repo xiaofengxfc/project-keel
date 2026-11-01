@@ -332,6 +332,29 @@
   box-shadow: none;
 }
 
+.training-stop-button {
+  min-height: 42px;
+  height: auto;
+  margin-top: 10px;
+  border: 1px solid #e6b8b4;
+  border-radius: 10px;
+  background: #fff7f5;
+  color: var(--training-danger);
+  font-size: 13px;
+  font-weight: 700;
+  transition: background .16s ease, border-color .16s ease;
+}
+
+.training-stop-button:hover:not(:disabled) {
+  background: #ffebe7;
+  border-color: #dc928b;
+}
+
+.training-stop-button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
 .training-page-error {
   padding: 11px 12px;
   border: 1px solid #efcfcc;

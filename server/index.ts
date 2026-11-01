@@ -207,7 +207,7 @@ type PredictionCandleInput = { time?: number; open?: number; high?: number; low?
 type PredictionRequestBody = { symbol?: string; interval?: string; candles?: PredictionCandleInput[]; horizonBars?: number }
 type PredictionTrainingMetrics = { accuracy?: number; brier?: number; testSamples?: number }
 type PredictionTrainingIntervalResult = {
-  phase: 'pending' | 'running' | 'completed' | 'not-promoted' | 'failed'
+  phase: 'pending' | 'running' | 'completed' | 'not-promoted' | 'failed' | 'stopped'
   error?: string | null
   metrics?: PredictionTrainingMetrics
   finishedAt?: number
@@ -215,7 +215,7 @@ type PredictionTrainingIntervalResult = {
 type PredictionTrainingJob = {
   jobId: string | null
   running: boolean
-  phase: 'idle' | 'running' | 'partial' | 'completed' | 'not-promoted' | 'failed'
+  phase: 'idle' | 'running' | 'partial' | 'completed' | 'not-promoted' | 'failed' | 'stopped'
   stage?: string
   output: string
   error: string | null
@@ -242,6 +242,35 @@ const trainingLogPath = resolve(process.env.PREDICTION_TRAINING_LOG_FILE ?? 'pre
 let predictionTrainingJob: PredictionTrainingJob = { jobId: null, running: false, phase: 'idle', output: '', error: null, startedAt: null, finishedAt: null }
 let predictionTrainingProcess: ChildProcess | null = null
 let predictionTrainingStartInFlight = false
+let predictionTrainingStopInFlight = false
+
+async function waitForPidExit(pid: number | undefined, timeoutMs = 10_000): Promise<void> {
+  if (!pid) return
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
+async function stopProcessTree(pid: number | undefined): Promise<void> {
+  if (!pid) return
+  if (process.platform !== 'win32') {
+    try { process.kill(-pid, 'SIGTERM') } catch { /* The worker may already have exited. */ }
+    await waitForPidExit(pid)
+    return
+  }
+  await new Promise<void>((resolve) => {
+    const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+    killer.once('error', () => resolve())
+    killer.once('close', () => resolve())
+  })
+  await waitForPidExit(pid)
+}
 
 async function persistPredictionTrainingJob(job: PredictionTrainingJob) {
   await mkdir(dirname(trainingStatePath), { recursive: true })
@@ -254,8 +283,8 @@ async function persistPredictionTrainingJob(job: PredictionTrainingJob) {
 async function readPredictionTrainingJob(): Promise<PredictionTrainingJob> {
   try {
     const value = JSON.parse(await readFile(trainingStatePath, 'utf8')) as PredictionTrainingJob
-    if (!value || typeof value !== 'object' || typeof value.running !== 'boolean' || !['idle', 'running', 'partial', 'completed', 'not-promoted', 'failed'].includes(value.phase)) throw new Error('训练状态文件格式无效')
-    if (value.running && predictionTrainingProcess === null) {
+    if (!value || typeof value !== 'object' || typeof value.running !== 'boolean' || !['idle', 'running', 'partial', 'completed', 'not-promoted', 'failed', 'stopped'].includes(value.phase)) throw new Error('训练状态文件格式无效')
+    if (value.running && predictionTrainingProcess === null && !predictionTrainingStopInFlight) {
       let alive = false
       if (value.workerPid && Number.isInteger(value.workerPid)) {
         try { process.kill(value.workerPid, 0); alive = true } catch { alive = false }
@@ -328,6 +357,51 @@ app.post<{ Body: PredictionRequestBody }>('/api/prediction', async (request, rep
 
 app.get('/api/prediction/train/status', async () => readPredictionTrainingJob())
 
+app.post('/api/prediction/train/stop', async (_request, reply) => {
+  if (predictionTrainingStopInFlight) return reply.code(409).send({ error: '正在停止模型训练，请稍候。', jobId: predictionTrainingJob.jobId })
+  if (predictionTrainingStartInFlight) return reply.code(409).send({ error: '模型训练正在准备启动，请稍候再停止。', jobId: predictionTrainingJob.jobId })
+  predictionTrainingStopInFlight = true
+  let current: PredictionTrainingJob | null = null
+  try {
+    current = await readPredictionTrainingJob()
+    if (!current.running) return reply.code(409).send({ error: '当前没有正在运行的模型训练任务。', jobId: current.jobId })
+    const pid = predictionTrainingProcess?.pid ?? current.workerPid
+    await persistPredictionTrainingJob({ ...current, stage: 'stopping', error: null })
+    await stopProcessTree(pid)
+    const latest = await readPredictionTrainingJob()
+    const intervalResults = { ...(latest.intervalResults ?? {}) }
+    const stoppedAt = Date.now()
+    for (const [interval, result] of Object.entries(intervalResults)) {
+      if (result && ['pending', 'running'].includes(result.phase)) {
+        intervalResults[interval] = { ...result, phase: 'stopped', error: '训练已由用户停止', finishedAt: stoppedAt }
+      }
+    }
+    const finishedIntervals = [...new Set([
+      ...(latest.finishedIntervals ?? []),
+      ...Object.entries(intervalResults).filter(([, result]) => result?.phase === 'stopped').map(([interval]) => interval),
+    ])]
+    const stopped = {
+      ...latest,
+      running: false,
+      phase: 'stopped' as const,
+      stage: 'stopped',
+      error: '训练已由用户停止。已保存的 K 线数据和模型文件保持不变。',
+      finishedAt: stoppedAt,
+      currentSymbol: undefined,
+      intervalResults,
+      finishedIntervals,
+      workerPid: undefined,
+    }
+    await persistPredictionTrainingJob(stopped)
+    predictionTrainingProcess = null
+    return stopped
+  } catch (error) {
+    return reply.code(500).send({ error: error instanceof Error ? `停止模型训练失败：${error.message}` : '停止模型训练失败', jobId: current?.jobId ?? predictionTrainingJob.jobId })
+  } finally {
+    predictionTrainingStopInFlight = false
+  }
+})
+
 app.get<{ Querystring: { symbol?: string; interval?: string; horizonBars?: string } }>('/api/prediction/validation/metrics', async (request, reply) => {
   const { symbol, interval, horizonBars } = request.query
   if (symbol && !/^[A-Z0-9]{3,20}$/i.test(symbol)) return reply.code(400).send({ error: 'symbol 格式无效' })
@@ -358,7 +432,7 @@ app.get<{ Querystring: { symbol?: string; interval?: string; horizonBars?: strin
 
 app.post<{ Body: { interval?: string; intervals?: string[]; symbolCount?: number; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
   const currentJob = await readPredictionTrainingJob()
-  if (currentJob.running || predictionTrainingStartInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。', jobId: currentJob.jobId })
+  if (currentJob.running || predictionTrainingStartInFlight || predictionTrainingStopInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。', jobId: currentJob.jobId })
   const intervalInput = request.body?.intervals ?? (request.body?.interval ? [request.body.interval] : [])
   if (!Array.isArray(intervalInput) || intervalInput.length < 1 || intervalInput.length > 4) return reply.code(400).send({ error: '请选择 1 到 4 个训练周期。' })
   const intervals = [...new Set(intervalInput.map((value) => String(value).trim()))]

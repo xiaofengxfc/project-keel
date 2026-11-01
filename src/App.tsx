@@ -311,6 +311,7 @@ function App() {
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ running: false })
   const [trainingRequestError, setTrainingRequestError] = useState('')
   const [trainingStatusError, setTrainingStatusError] = useState('')
+  const [trainingStopInFlight, setTrainingStopInFlight] = useState(false)
   const trainingStatusRequestInFlightRef = useRef(false)
   const trainingSubmitInFlightRef = useRef(false)
   const trainingInterval = trainingIntervals[0] ?? '1h'
@@ -1268,6 +1269,22 @@ function App() {
     }
   }
 
+  const stopModelTraining = async () => {
+    if (!trainingStatus.running || trainingStopInFlight) return
+    setTrainingStopInFlight(true)
+    setTrainingStatusError('')
+    try {
+      const response = await fetch('/api/prediction/train/stop', { method: 'POST' })
+      const payload = await response.json() as TrainingStatus & { error?: string }
+      if (!response.ok) throw new Error(payload.error ?? '无法停止模型训练')
+      setTrainingStatus(payload)
+    } catch (error) {
+      setTrainingStatusError(error instanceof Error ? error.message : '无法停止模型训练')
+    } finally {
+      setTrainingStopInFlight(false)
+    }
+  }
+
   const indicatorPanel = indicatorsOpen ? <div className="indicator-panel">
     <div className="indicator-panel-head"><div><span className="eyebrow">INDICATORS</span><b>图表指标</b></div><button type="button" onClick={() => setIndicatorsOpen(false)} aria-label="关闭指标设置">×</button></div>
     <div className="indicator-columns"><div><strong>图表显示</strong>{chartIndicatorOptions.map(({ key, label }) => <label className="indicator-check" key={`chart-${key}`}><input type="checkbox" checked={chartIndicators[key]} onChange={(event) => setChartIndicators((current) => ({ ...current, [key]: event.target.checked }))} /><span>{label}</span></label>)}</div></div>
@@ -1275,8 +1292,8 @@ function App() {
   </div> : null
   const statusIntervals = trainingStatus.intervals?.length ? trainingStatus.intervals : trainingIntervals
   const intervalResults = trainingStatus.intervalResults ?? trainingStatus.results ?? {}
-  const trainingBadgeLabel = trainingStatus.running ? '训练中' : trainingStatus.phase === 'partial' ? '部分完成' : trainingStatus.phase === 'completed' ? '已完成' : trainingStatus.phase === 'not-promoted' ? '未晋级' : trainingStatus.phase === 'failed' ? '未完成' : '等待训练'
-  const stageLabels: Record<string, string> = { starting: '正在准备任务', collecting: '正在采集历史 K 线', training: '正在训练模型', validating: '正在评估候选模型', exporting: '正在导出模型文件', promoting: '正在保存并加载模型', 'not-promoted': '候选模型未晋级', completed: '当前周期已完成', failed: '当前周期失败', interrupted: '训练进程已中断', finished: '任务已结束' }
+  const trainingBadgeLabel = trainingStatus.running ? '训练中' : trainingStatus.phase === 'partial' ? '部分完成' : trainingStatus.phase === 'completed' ? '已完成' : trainingStatus.phase === 'not-promoted' ? '未晋级' : trainingStatus.phase === 'stopped' ? '已停止' : trainingStatus.phase === 'failed' ? '未完成' : '等待训练'
+  const stageLabels: Record<string, string> = { starting: '正在准备任务', collecting: '正在采集历史 K 线', training: '正在训练模型', validating: '正在评估候选模型', exporting: '正在导出模型文件', promoting: '正在保存并加载模型', stopping: '正在停止训练', 'not-promoted': '候选模型未晋级', completed: '当前周期已完成', failed: '当前周期失败', stopped: '训练已停止', interrupted: '训练进程已中断', finished: '任务已结束' }
   const trainingStageLabel = trainingStatus.stage ? stageLabels[trainingStatus.stage] ?? trainingStatus.stage : (trainingStatus.phase === 'running' ? '任务正在运行' : '')
   const intervalResultPhase = (result: TrainingIntervalResult | undefined) => result?.status ?? result?.phase
   const resultStatusLabel = (result: TrainingIntervalResult | undefined, value: Interval) => {
@@ -1284,6 +1301,7 @@ function App() {
     if (phase === 'completed') return '已完成并晋级'
     if (phase === 'not-promoted') return '训练完成，候选未晋级'
     if (phase === 'failed') return '训练失败'
+    if (phase === 'stopped') return '已停止'
     if (phase === 'running' || (trainingStatus.running && trainingStatus.currentInterval === value)) return '正在处理'
     if (trainingStatus.completedIntervals?.includes(value)) return '已完成'
     return trainingStatus.running ? '等待训练' : '尚无结果'
@@ -1291,7 +1309,7 @@ function App() {
   const trainingPage = <section className="training-page panel">
     <div className="training-page-header">
       <div><span className="eyebrow">LOCAL MODEL WORKSHOP</span><h1>通用 K 线模型训练</h1><p>从 Binance 当前可交易的 USDT 永续合约中随机选币训练通用模型。可顺序训练多个周期，每个周期独立验证和晋级。</p></div>
-      <span className={`training-status-badge ${trainingStatus.running ? 'running' : trainingStatus.phase === 'completed' || trainingStatus.phase === 'partial' ? 'completed' : trainingStatus.phase === 'not-promoted' || trainingStatus.phase === 'failed' ? 'failed' : ''}`}><i />{trainingBadgeLabel}</span>
+      <span className={`training-status-badge ${trainingStatus.running ? 'running' : trainingStatus.phase === 'completed' || trainingStatus.phase === 'partial' ? 'completed' : trainingStatus.phase === 'not-promoted' || trainingStatus.phase === 'failed' || trainingStatus.phase === 'stopped' ? 'failed' : ''}`}><i />{trainingBadgeLabel}</span>
     </div>
     <div className="training-page-grid">
       <section className="training-config-card">
@@ -1305,7 +1323,8 @@ function App() {
           <label>手动指定币种（可选）<input value={trainingSymbols} onChange={(event) => setTrainingSymbols(event.target.value)} disabled={trainingStatus.running} placeholder="留空则全部随机；也可填写 BTCUSDT,ETHUSDT" /></label>
           <small>数量为 2–30。手动输入的交易对会保留，剩余名额从其他可交易币种中随机补足；手动币种数不能超过设定数量。多周期任务会逐个周期顺序执行。</small>
         </div>
-        <button type="button" className="training-start-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running}>{trainingStatus.running ? '模型正在训练…' : '开始训练模型'}</button>
+        <button type="button" className="training-start-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running || trainingStopInFlight}>{trainingStatus.running ? '模型正在训练…' : '开始训练模型'}</button>
+        <button type="button" className="training-stop-button" onClick={() => void stopModelTraining()} disabled={!trainingStatus.running || trainingStopInFlight}>{trainingStopInFlight ? '正在停止…' : '停止训练'}</button>
         {(trainingRequestError || trainingStatus.error || trainingStatusError) && <div className="training-page-error" role="alert">{trainingRequestError || trainingStatus.error || trainingStatusError}</div>}
       </section>
       <section className="training-run-card">
@@ -1314,6 +1333,7 @@ function App() {
           : trainingStatus.phase === 'completed' ? <div className="training-page-result" role="status"><strong>所选周期训练任务已结束</strong><small>每个周期的验证和模型晋级结果如下。</small></div>
             : trainingStatus.phase === 'not-promoted' ? <div className="training-idle failed" role="status">训练已完成，但候选模型未能晋级；现有模型保持不变。请查看周期结果与评估指标。</div>
             : trainingStatus.phase === 'partial' ? <div className="training-idle failed" role="status">部分周期已完成，至少一个周期失败或未能晋级；请查看各周期结果与日志。</div>
+              : trainingStatus.phase === 'stopped' ? <div className="training-idle" role="status">训练已停止；已保存的 K 线数据和模型文件保持不变。</div>
               : trainingStatus.phase === 'failed' ? <div className="training-idle failed" role="status">训练任务失败。请查看下方阶段错误和详细日志。</div>
                 : <div className="training-idle">尚未启动训练。模型文件会分别保存在 <code>prediction/models/&lt;周期&gt;</code>。</div>}
         <div className="training-interval-results">{statusIntervals.map((value) => {
