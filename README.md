@@ -13,7 +13,7 @@ KEEL 是一个面向个人交易的 Binance USDⓈ-M Futures 工作台，采用�
 - 支持手动画线和趋势线，并将画线按交易对保存到浏览器本地；切回选择工具后双击手动画线或趋势线可删除。
 - 支持 15 分钟、1 小时、4 小时和 1 天 K 线；自动周期模式先用 1 小时识别，遇到震荡或突破观察时切换到 15 分钟并保持，直到手动选择周期、重新点击自动或切换交易对。
 - 搜索框可搜索 Binance 可交易的 USDT 本位永续合约；点 ☆ 收藏后加入自选行情，列表支持拖拽或箭头排序并保存到浏览器本地。
-- AI 解释层可读取通用模型的方向、概率、置信度和近期已收盘 K 线，解释模型依据、风险与失效条件。
+- AI 解释层可读取所选币种模型的方向、概率、置信度和近期已收盘 K 线，解释模型依据、风险与失效条件。
 - 震荡区间会区分下沿做多、上沿做空和中部观望，并标注边界外止损、区间另一侧止盈及最低参考盈亏比。
 - 本地 Fastify 后端负责账户读取、交易规则校验和 Binance 私有接口签名。
 - 下单支持限价、市价、止损/止盈限价与市价、追踪止损，以及订单有效期、触发价类型、价格保护、只减仓/全平、持仓模式、杠杆和全仓/逐仓设置；数量步长与价格 tick size 按 Binance 交易规则校验。
@@ -75,14 +75,14 @@ OPENAI_MODEL=你的模型名称
 ```powershell
 python -m pip install -r prediction\requirements.txt
 python -m prediction.collect_klines --symbol BTCUSDT --interval 1h --start-time 1704067200000 --output data\BTCUSDT-1h.csv
-python -m prediction.train --input data --interval 1h --horizon-bars 3 --output-dir prediction\models\1h
+python -m prediction.train --input data\BTCUSDT-1h.csv --symbol BTCUSDT --interval 1h --horizon-bars 3 --output-dir prediction\models\1h\BTCUSDT
 $env:PREDICTION_MODEL_DIR = "prediction\models"
 python -m prediction.service
 ```
 
 使用项目的 Node 后端启动时，只要 `PREDICTION_ENABLED=true` 且 `PREDICTION_SERVICE_URL` 指向本机地址，后端会根据 `.env` 中的 Python 配置自动启动本地预测服务；只有单独运行 Python 服务或使用外部预测地址时，才需要手动执行上面的命令。
 
-通用模型可以由 `prediction.auto_train` 定期重训练。它会合并多个交易对的数据，只在候选模型通过指标门槛且不劣于当前模型时替换，并保留上一版本回滚。
+单币种模型可以由 `prediction.auto_train` 定期重训练。它只使用指定币种的数据，只在候选模型通过指标门槛且不劣于当前版本时替换，并保留上一版本回滚。
 
 再在 `.env` 中启用后端代理：
 
@@ -91,7 +91,7 @@ PREDICTION_ENABLED=true
 PREDICTION_SERVICE_URL=http://127.0.0.1:8790/predict
 ```
 
-将多个交易对的 CSV 一起传给训练命令会生成通用模型，特征使用相对收益、波动率和成交量比等指标，推理时可覆盖训练数据中的交易对。每个周期要单独训练并放入 `prediction/models/<interval>`；如果只传一个 CSV 并指定交易对，则生成的模型只适用于该交易对。
+训练命令只接受一个币种和一个 CSV，模型保存在 `prediction/models/<周期>/<币种>/`，预测时只会加载对应币种和周期的模型。特征使用相对收益、波动率和成交量比等指标。每个周期要单独训练。
 
 ## 检查命令
 

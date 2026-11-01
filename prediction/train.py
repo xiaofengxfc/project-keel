@@ -1,8 +1,8 @@
 """Train a LightGBM direction model and export it as ONNX.
 
 Example:
-  python -m prediction.train --input data/BTCUSDT-1h.csv data/ETHUSDT-1h.csv \
-    --interval 1h --horizon-bars 3 --output-dir prediction/models/1h
+  python -m prediction.train --input data/BTCUSDT-1h.csv --symbol BTCUSDT \
+    --interval 1h --horizon-bars 3 --output-dir prediction/models/1h/BTCUSDT
 
 Training dependencies are intentionally imported lazily so data collection
 and feature validation still work in a minimal Python installation.
@@ -148,8 +148,8 @@ def feature_indices_for_model(current_features: list[str], model_features: Any) 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a local LightGBM direction model")
-    parser.add_argument("--input", required=True, type=Path, nargs="+", help="一个或多个 CSV；每个文件包含 time,open,high,low,close,volume")
-    parser.add_argument("--symbol", help="交易对；多个 CSV 默认训练通用模型（*），单个 CSV 未提供时从文件名推断")
+    parser.add_argument("--input", required=True, type=Path, help="单个 CSV 文件；包含 time,open,high,low,close,volume")
+    parser.add_argument("--symbol", required=True, help="针对性训练的交易对")
     parser.add_argument("--interval", choices=["15m", "1h", "4h", "1d"], required=True)
     parser.add_argument("--horizon-bars", type=int, default=3)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -160,51 +160,36 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 < args.test_ratio < 0.5 or not 0 < args.validation_ratio < 0.5 or args.test_ratio + args.validation_ratio >= 0.8:
         parser.error("test-ratio 和 validation-ratio 必须合理且总和小于 0.8")
-    input_paths: list[Path] = []
-    for path in args.input:
-        if path.is_dir():
-            input_paths.extend(sorted(path.glob(f"*-{args.interval}.csv")))
-        else:
-            input_paths.append(path)
-    if not input_paths:
-        parser.error("没有找到可训练的 CSV 文件")
-    inferred_symbols = [path.stem.split("-")[0].upper() for path in input_paths]
-    if len(input_paths) > 1 and args.symbol and args.symbol.upper() not in {"*", "ALL"}:
-        parser.error("多个输入文件必须训练通用模型，请省略 --symbol 或使用 --symbol *")
-    symbol = (args.symbol or (inferred_symbols[0] if len(input_paths) == 1 else "*")).upper()
-    if symbol not in {"*", "ALL"} and (not symbol.isalnum() or not 3 <= len(symbol) <= 20):
+    input_path = args.input
+    if input_path.is_dir():
+        parser.error("--input 必须是单个 CSV 文件，不能传入目录")
+    if input_path.suffix.lower() != ".csv":
+        parser.error("--input 必须指向 CSV 文件")
+    if not input_path.is_file():
+        parser.error(f"找不到输入 CSV 文件：{input_path}")
+    inferred_symbol = input_path.stem.split("-")[0].upper()
+    symbol = args.symbol.upper()
+    if not symbol.isalnum() or not 3 <= len(symbol) <= 20:
         parser.error("symbol 必须是 3 到 20 位字母或数字")
-    if symbol == "ALL":
-        symbol = "*"
-    training_rows: list[tuple[float, float, list[float], int, float]] = []
-    source_candles: list[Candle] = []
-    for input_index, input_path in enumerate(input_paths, start=1):
-        candles = drop_open_candle(read_csv(input_path), args.interval)
-        report_progress(
-            "preparing",
-            interval=args.interval,
-            currentSymbol=inferred_symbols[input_index - 1],
-            symbolIndex=input_index,
-            symbolCount=len(input_paths),
-            pagesFetched=0,
-            rowsFetched=0,
-            message=f"正在为 {inferred_symbols[input_index - 1]} 构造训练特征",
-        )
-        features_for_symbol, labels_for_symbol, returns_for_symbol = build_training_rows(candles, args.horizon_bars, args.neutral_threshold)
-        source_candles.extend(candles)
-        row_times = [candles[index].time for index in range(49, len(candles) - args.horizon_bars)]
-        label_end_times = [candles[index + args.horizon_bars].time for index in range(49, len(candles) - args.horizon_bars)]
-        training_rows.extend(zip(row_times, label_end_times, features_for_symbol, labels_for_symbol, returns_for_symbol))
-    # Keep the chronological split meaningful when several symbols are mixed.
-    training_rows.sort(key=lambda row: row[0])
-    row_times = [row[0] for row in training_rows]
-    label_end_times = [row[1] for row in training_rows]
-    features = [row[2] for row in training_rows]
-    labels = [row[3] for row in training_rows]
-    returns = [row[4] for row in training_rows]
+    if symbol != inferred_symbol:
+        parser.error("symbol 必须与输入 CSV 文件名中的交易对一致")
+    candles = drop_open_candle(read_csv(input_path), args.interval)
+    report_progress(
+        "preparing",
+        interval=args.interval,
+        currentSymbol=symbol,
+        symbolIndex=1,
+        symbolCount=1,
+        pagesFetched=0,
+        rowsFetched=0,
+        message=f"正在为 {symbol} 构造训练特征",
+    )
+    features, labels, _ = build_training_rows(candles, args.horizon_bars, args.neutral_threshold)
+    row_times = [candles[index].time for index in range(49, len(candles) - args.horizon_bars)]
+    label_end_times = [candles[index + args.horizon_bars].time for index in range(49, len(candles) - args.horizon_bars)]
     if len(features) < 120:
         parser.error(f"有效训练样本只有 {len(features)} 条，至少需要 120 条")
-    report_progress("fitting", interval=args.interval, currentSymbol=None, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message=f"已准备 {len(features)} 条训练样本，开始拟合模型")
+    report_progress("fitting", interval=args.interval, currentSymbol=symbol, symbolIndex=1, symbolCount=1, rowsFetched=len(features), message=f"已准备 {len(features)} 条训练样本，开始拟合模型")
     try:
         import numpy as np
         import lightgbm as lgb
@@ -248,7 +233,7 @@ def main() -> None:
     probabilities = apply_temperature(model.predict_proba(x_test).tolist(), temperature)
     metrics = classification_metrics(probabilities, y_test.tolist())
     brier = brier_score(probabilities, y_test.tolist()) if len(y_test) else 0.0
-    report_progress("validating", interval=args.interval, currentSymbol=None, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message="测试集评估与 incumbent 对比准备完成")
+    report_progress("validating", interval=args.interval, currentSymbol=symbol, symbolIndex=1, symbolCount=1, rowsFetched=len(features), message="测试集评估与 incumbent 对比准备完成")
     baseline_comparison: dict[str, Any] = {"compatible": False, "reason": "没有提供 incumbent 模型"}
     if args.baseline_model_dir:
         baseline_metadata_path = args.baseline_model_dir / "metadata.json"
@@ -273,7 +258,7 @@ def main() -> None:
                 baseline_comparison = {"compatible": False, "reason": "incumbent 特征 schema 与本地特征不兼容"}
         else:
             baseline_comparison = {"compatible": False, "reason": "incumbent native model or metadata is missing"}
-    report_progress("exporting", interval=args.interval, currentSymbol=None, symbolIndex=len(input_paths), symbolCount=len(input_paths), rowsFetched=len(features), message="正在导出 LightGBM 和 ONNX 模型")
+    report_progress("exporting", interval=args.interval, currentSymbol=symbol, symbolIndex=1, symbolCount=1, rowsFetched=len(features), message="正在导出 LightGBM 和 ONNX 模型")
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     native_path = output_dir / "direction.txt"
@@ -310,9 +295,8 @@ def main() -> None:
             "testStart": test_start_time,
             "purgedOverlap": True,
         },
-        "trainedThrough": max(candle.time for candle in source_candles),
-        "source": [str(path) for path in input_paths],
-        "trainingSymbols": sorted(set(inferred_symbols)),
+        "trainedThrough": max(candle.time for candle in candles),
+        "source": str(input_path),
         "expectedReturnModel": None,
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

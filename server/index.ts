@@ -520,21 +520,16 @@ app.get<{ Querystring: { symbol?: string; interval?: string; horizonBars?: strin
   }
 })
 
-app.post<{ Body: { interval?: string; intervals?: string[]; symbolCount?: number; symbols?: string[] } }>('/api/prediction/train', async (request, reply) => {
+app.post<{ Body: { interval?: string; intervals?: string[]; symbol?: string } }>('/api/prediction/train', async (request, reply) => {
   const currentJob = await readPredictionTrainingJob()
   if (currentJob.running || predictionTrainingStartInFlight || predictionTrainingStopInFlight) return reply.code(409).send({ error: '模型训练正在运行或准备中，请等待完成。', jobId: currentJob.jobId })
   const intervalInput = request.body?.intervals ?? (request.body?.interval ? [request.body.interval] : [])
   if (!Array.isArray(intervalInput) || intervalInput.length < 1 || intervalInput.length > 4) return reply.code(400).send({ error: '请选择 1 到 4 个训练周期。' })
   const intervals = [...new Set(intervalInput.map((value) => String(value).trim()))]
   if (!intervals.length || intervals.some((value) => !['15m', '1h', '4h', '1d'].includes(value))) return reply.code(400).send({ error: '请选择有效周期：15m、1h、4h 或 1d。' })
-  const symbolCount = Number(request.body?.symbolCount)
-  if (!Number.isInteger(symbolCount) || symbolCount < 2 || symbolCount > 30) return reply.code(400).send({ error: '币种数量必须是 2 到 30 之间的整数。' })
-  if (request.body?.symbols !== undefined && !Array.isArray(request.body.symbols)) return reply.code(400).send({ error: '手动币种列表格式无效。' })
-  const requestedSymbols = [...new Set((request.body?.symbols ?? []).map((symbol) => String(symbol).trim().toUpperCase()).filter(Boolean))]
-  if (requestedSymbols.some((symbol) => !/^[A-Z0-9]{3,20}$/.test(symbol))) return reply.code(400).send({ error: '手动填写的交易对格式无效。' })
-  if (requestedSymbols.length > symbolCount) return reply.code(400).send({ error: `手动填写的交易对不能超过 ${symbolCount} 个。` })
+  const symbol = String(request.body?.symbol ?? '').trim().toUpperCase()
+  if (!/^[A-Z0-9]{3,20}$/.test(symbol)) return reply.code(400).send({ error: '请选择一个有效的训练交易对。' })
   predictionTrainingStartInFlight = true
-  let symbols: string[] = []
   try {
     let catalog: Array<{ symbol: string; baseAsset: string }>
     if (cachedSymbols && cachedSymbols.expiresAt > Date.now()) {
@@ -545,17 +540,8 @@ app.post<{ Body: { interval?: string; intervals?: string[]; symbolCount?: number
       cachedSymbols = { expiresAt: Date.now() + 10 * 60 * 1000, symbols: next }
       catalog = next
     }
-    symbols = catalog.map(({ symbol }) => symbol.toUpperCase())
-    const available = new Set(symbols)
-    const unavailable = requestedSymbols.filter((symbol) => !available.has(symbol))
-    if (unavailable.length) return reply.code(400).send({ error: `交易对当前不可用：${unavailable.join(', ')}` })
-    const pool = symbols.filter((symbol) => !requestedSymbols.includes(symbol))
-    for (let index = pool.length - 1; index > 0; index -= 1) {
-      const swapIndex = crypto.randomInt(index + 1)
-      ;[pool[index], pool[swapIndex]] = [pool[swapIndex], pool[index]]
-    }
-    symbols = [...requestedSymbols, ...pool.slice(0, symbolCount - requestedSymbols.length)]
-    if (symbols.length < symbolCount) return reply.code(502).send({ error: `Binance 当前仅返回 ${symbols.length} 个可训练交易对。` })
+    const available = new Set(catalog.map(({ symbol: value }) => value.toUpperCase()))
+    if (!available.has(symbol)) return reply.code(400).send({ error: `交易对当前不可用：${symbol}` })
   } catch (error) {
     return reply.code(502).send({ error: error instanceof Error ? `获取 Binance 训练币种失败：${error.message}` : '获取 Binance 训练币种失败' })
   } finally {
@@ -586,22 +572,22 @@ app.post<{ Body: { interval?: string; intervals?: string[]; symbolCount?: number
     completedIntervals: [],
     finishedIntervals: [],
     intervalResults: Object.fromEntries(intervals.map((value) => [value, { phase: 'pending' }])),
-    symbols,
-    symbolCount: symbols.length,
+    symbols: [symbol],
+    symbolCount: 1,
     symbolIndex: 0,
     pagesFetched: 0,
     rowsFetched: 0,
   }
   try {
     await mkdir(dirname(trainingStatePath), { recursive: true })
-    await writeFile(trainingLogPath, `任务 ${jobId} 已创建\n币种：${symbols.join(', ')}\n周期：${intervals.join(', ')}\n`, 'utf8')
+    await writeFile(trainingLogPath, `任务 ${jobId} 已创建\n币种：${symbol}\n周期：${intervals.join(', ')}\n`, 'utf8')
     await writeFile(progressPath, JSON.stringify({ jobId, phase: 'starting', interval: intervals[0] }), 'utf8')
     await persistPredictionTrainingJob(initialJob)
     const child = spawn(pythonPath, [
       '-u', '-m', 'prediction.training_worker',
       '--job-id', jobId,
       '--intervals', intervals.join(','),
-      '--symbols', symbols.join(','),
+      '--symbol', symbol,
       '--state-file', trainingStatePath,
       '--progress-file', progressPath,
       '--log-file', trainingLogPath,
@@ -1047,7 +1033,7 @@ app.post<{ Body: { question?: string; context?: ExplanationContext } }>('/api/as
     const requestBody = {
       model: aiModel,
       messages: [
-        { role: 'system', content: '你是 KEEL 的自动 AI 解释层，服务于 Binance USDⓈ-M Futures K 线预测。你不是独立预测器，也不是下单顾问；只能解释上下文中本地通用模型给出的方向、概率、置信度、预测周期、验证指标和近期已收盘 K 线。上涨、下跌、中性概率已经由数值模型计算并在界面单独显示；不要重复这些数字、不要改写或计算概率。绝对不要补造数据、声称保证正确率、生成买卖指令、入场价、止盈止损、杠杆或仓位。只使用本次上下文，不声称拿到了未提供的实时行情。验证准确率偏低、样本不足、输入数据不足、模型过期或概率接近时，应明确说明模型表现/证据有限并指出不确定性，不要隐藏或夸大预测。用简短中文纯文本回答，固定包含四段：预测解读、数据依据、风险与失效条件、解释边界。方向为 NEUTRAL 时解释为信号不明确；禁止给出交易建议。所有内容仅用于理解模型，不构成投资建议，也不会自动下单。不要使用 Markdown、星号、井号、反引号、项目符号或代码围栏。' },
+        { role: 'system', content: '你是 KEEL 的自动 AI 解释层，服务于 Binance USDⓈ-M Futures K 线预测。你不是独立预测器，也不是下单顾问；只能解释上下文中所选币种本地模型给出的方向、概率、置信度、预测周期、验证指标和近期已收盘 K 线。上涨、下跌、中性概率已经由数值模型计算并在界面单独显示；不要重复这些数字、不要改写或计算概率。绝对不要补造数据、声称保证正确率、生成买卖指令、入场价、止盈止损、杠杆或仓位。只使用本次上下文，不声称拿到了未提供的实时行情。验证准确率偏低、样本不足、输入数据不足、模型过期或概率接近时，应明确说明模型表现/证据有限并指出不确定性，不要隐藏或夸大预测。用简短中文纯文本回答，固定包含四段：预测解读、数据依据、风险与失效条件、解释边界。方向为 NEUTRAL 时解释为信号不明确；禁止给出交易建议。所有内容仅用于理解模型，不构成投资建议，也不会自动下单。不要使用 Markdown、星号、井号、反引号、项目符号或代码围栏。' },
         { role: 'user', content: `当前上下文：${JSON.stringify(context)}\n\n问题：${question}` },
       ],
       temperature: 0.4,
@@ -1101,4 +1087,3 @@ app.listen({ port: Number(process.env.PORT ?? 8788), host: '127.0.0.1' }).catch(
   app.log.error(error)
   process.exit(1)
 })
-

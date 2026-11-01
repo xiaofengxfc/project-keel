@@ -1,10 +1,9 @@
-"""Collect data and promote a validated global model locally.
+"""Collect data and promote a validated single-symbol model locally.
 
 This is deliberately an opt-in, one-shot job. Run it from a scheduler after
-deciding the symbol list and interval in the environment. Candidates are
+deciding the symbol and interval in the environment. Candidates are
 compared against the incumbent on the same purged chronological test fold
-when the incumbent feature schema can be aligned by name. The model remains
-a single pooled model.
+when the incumbent feature schema can be aligned by name.
 """
 
 from __future__ import annotations
@@ -171,44 +170,41 @@ def run_collector(symbol: str, interval: str, start_time: int, output_path: Path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Retrain and promote the global KEEL prediction model")
-    parser.add_argument("--symbols", default=os.getenv("PREDICTION_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT"))
+    parser = argparse.ArgumentParser(description="Retrain and promote a single-symbol KEEL prediction model")
+    parser.add_argument("--symbol", default=os.getenv("PREDICTION_SYMBOL", "BTCUSDT"))
     parser.add_argument("--interval", choices=["15m", "1h", "4h", "1d"], default=os.getenv("PREDICTION_INTERVAL", "1h"))
     parser.add_argument("--start-time", type=int, default=int(os.getenv("PREDICTION_START_TIME", "1704067200000")))
     parser.add_argument("--data-dir", type=Path, default=Path(os.getenv("PREDICTION_DATA_DIR", "data")))
     parser.add_argument("--model-root", type=Path, default=Path(os.getenv("PREDICTION_MODEL_DIR", "prediction/models")))
     parser.add_argument("--min-test-samples", type=int, default=int(os.getenv("PREDICTION_MIN_TEST_SAMPLES", "500")))
     args = parser.parse_args()
-    symbols = sorted({item.strip().upper() for item in args.symbols.split(",") if item.strip()})
-    if len(symbols) < 2:
-        parser.error("通用模型至少需要两个交易对")
+    symbol = args.symbol.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{3,20}", symbol):
+        parser.error("symbol 必须是 3 到 20 位字母或数字")
     if args.start_time < 0:
         parser.error("start-time 必须为非负 Unix 毫秒时间")
     args.data_dir.mkdir(parents=True, exist_ok=True)
     args.model_root.mkdir(parents=True, exist_ok=True)
-    target = args.model_root / args.interval
-    backup = args.model_root / f"{args.interval}.previous"
+    target = args.model_root / args.interval / symbol
+    backup = target.parent / f"{symbol}.previous"
     if backup.exists() and not target.exists():
         backup.rename(target)
-    input_paths: list[str] = []
-    for index, symbol in enumerate(symbols, start=1):
-        output_path = args.data_dir / f"{symbol}-{args.interval}.csv"
-        report_progress("collecting", interval=args.interval, currentSymbol=symbol, symbolIndex=index, symbolCount=len(symbols), pagesFetched=0, rowsFetched=0, message=f"正在检查并更新 {symbol} 历史 K 线")
-        run_collector(symbol, args.interval, args.start_time, output_path, index, len(symbols))
-        input_paths.append(str(output_path))
+    output_path = args.data_dir / f"{symbol}-{args.interval}.csv"
+    report_progress("collecting", interval=args.interval, currentSymbol=symbol, symbolIndex=1, symbolCount=1, pagesFetched=0, rowsFetched=0, message=f"正在检查并更新 {symbol} 历史 K 线")
+    run_collector(symbol, args.interval, args.start_time, output_path, 1, 1)
 
     with tempfile.TemporaryDirectory(prefix="keel-model-") as temporary:
-        candidate = Path(temporary) / args.interval
+        candidate = Path(temporary) / args.interval / symbol
         train_args = [
-            "--input", *input_paths, "--interval", args.interval,
+            "--input", str(output_path), "--symbol", symbol, "--interval", args.interval,
             "--horizon-bars", os.getenv("PREDICTION_HORIZON_BARS", "3"),
             "--output-dir", str(candidate),
         ]
-        report_progress("preparing", interval=args.interval, currentSymbol=None, symbolIndex=len(symbols), symbolCount=len(symbols), message="K 线采集完成，开始准备训练特征")
+        report_progress("preparing", interval=args.interval, currentSymbol=None, symbolIndex=1, symbolCount=1, message=f"{symbol} K 线采集完成，开始准备训练特征")
         if (target / "direction.txt").is_file() and (target / "metadata.json").is_file():
             train_args.extend(["--baseline-model-dir", str(target)])
         run_module("prediction.train", train_args)
-        report_progress("validating", interval=args.interval, currentSymbol=None, symbolIndex=len(symbols), symbolCount=len(symbols), message="训练完成，正在检查样本与评估指标")
+        report_progress("validating", interval=args.interval, currentSymbol=None, symbolIndex=1, symbolCount=1, message="训练完成，正在检查样本与评估指标")
         metadata = json.loads((candidate / "metadata.json").read_text(encoding="utf-8"))
         current_metadata_path = target / "metadata.json"
         current = None
@@ -226,10 +222,10 @@ def main() -> None:
         # directories is atomic on the same volume, so a failed promotion can
         # restore the previous model instead of leaving the service without a
         # model.
-        staged = args.model_root / f".{args.interval}.staged-{os.getpid()}"
-        backup = args.model_root / f"{args.interval}.previous"
+        staged = target.parent / f".{symbol}.staged-{os.getpid()}"
         if staged.exists():
             shutil.rmtree(staged)
+        target.parent.mkdir(parents=True, exist_ok=True)
         if backup.exists():
             shutil.rmtree(backup)
         shutil.copytree(candidate, staged)
@@ -246,7 +242,7 @@ def main() -> None:
             if staged.exists():
                 shutil.rmtree(staged, ignore_errors=True)
         report_progress("completed", interval=args.interval, metrics=metadata.get("metrics", {}), error=None, message=f"{args.interval} 模型已晋级并保存")
-        print(f"promoted global {args.interval} model: accuracy={accuracy:.4f}, brier={brier:.4f}")
+        print(f"promoted {symbol} {args.interval} model: accuracy={accuracy:.4f}, brier={brier:.4f}")
 
 
 if __name__ == "__main__":

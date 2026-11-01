@@ -21,16 +21,16 @@ python -m prediction.collect_klines --symbol BTCUSDT --interval 1h --start-time 
 ## 训练和导出
 
 ```powershell
-python -m prediction.train --input data --interval 1h --horizon-bars 3 --output-dir prediction\models\1h
+python -m prediction.train --input data\BTCUSDT-1h.csv --symbol BTCUSDT --interval 1h --horizon-bars 3 --output-dir prediction\models\1h\BTCUSDT
 ```
 
-传入包含 `*-1h.csv` 文件的目录或多个 CSV 会训练一个通用模型，元数据中的 `symbol` 为 `*`，推理时可用于训练覆盖范围内的任意交易对。单个 CSV 可以通过 `--symbol BTCUSDT` 生成单币种模型。每个周期分别训练，不能把 15m、1h 等不同周期混在同一个模型中。训练会按时间顺序划分训练、验证和测试集，并输出：
+训练命令只接受一个 CSV 和一个 `--symbol`，模型只适用于该币种。每个周期分别训练，不能把 15m、1h 等不同周期混在同一个模型中。训练会按时间顺序划分训练、验证和测试集，并输出：
 
 - `direction.txt`：LightGBM 原生模型
 - `direction.onnx`：CPU ONNX 推理模型
 - `metadata.json`：特征、类别、周期、模型版本和测试指标
 
-至少需要 120 条有效训练样本；通用模型建议为每个交易对准备数千根以上的历史 K 线，并覆盖不同市场阶段。特征使用收益率、波动率、成交量比等相对值，因此不会依赖某个币种的绝对价格。
+至少需要 120 条有效训练样本；单币种模型建议准备数千根以上的历史 K 线，并覆盖不同市场阶段。特征使用收益率、波动率、成交量比等相对值。
 
 ## 启动推理服务
 
@@ -63,17 +63,17 @@ POST /predict
 
 ## 自动重训练
 
-可以把下面的一次性命令交给 Windows 任务计划程序或其他调度器定期执行。它会采集多个交易对、训练候选通用模型，并且只有候选模型同时不劣于当前模型时才替换；旧模型保存在 `prediction/models/1h.previous`。
+可以把下面的一次性命令交给 Windows 任务计划程序或其他调度器定期执行。它会采集一个交易对、训练候选单币种模型，并且只有候选模型同时不劣于当前版本时才替换；旧模型保存在对应币种目录旁的 `.previous` 目录。
 
 ```powershell
-python -m prediction.auto_train --symbols BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT --interval 1h
+python -m prediction.auto_train --symbol BTCUSDT --interval 1h
 ```
 
 重训练任务按时间顺序建立训练、校准和独立测试折，并 purge 标签跨界样本，要求足够的独立测试样本，报告准确率、平衡准确率、宏 F1、覆盖率和 Brier 分数；当前模型可兼容时，会在同一测试折上做比较，无法公平比较时不会自动晋级。该留出评估不等同于“未见币种”测试，也不证明模型能泛化到任意资产；应在不同币种与市场阶段持续评估。不会用固定准确率百分比隐藏方向概率。界面显示上涨、下跌和中性概率，并同时呈现测试指标与持续累积的前向验证结果；这些历史指标不保证未来表现。
 
-重训练完成后重启本地推理服务，使其加载新模型。不要把自动重训练直接连接到下单逻辑。
+重训练完成后会尝试让本地推理服务热加载新模型；如果服务未运行或热加载失败，再重启服务。不要把自动重训练直接连接到下单逻辑。
 
-侧边栏的“模型训练”页面可同时选择多个周期。后端会在一个持久任务中逐周期训练，各周期独立验证、晋级并保存在 `prediction/models/<周期>/`；刷新页面会重新读取任务状态。任务状态和最近日志默认保存在 `prediction/validation/training-state.json` 与 `training.log`，可用 `PREDICTION_TRAINING_STATE_FILE`、`PREDICTION_TRAINING_LOG_FILE` 更改位置。各周期结果相互独立，单个周期失败不会撤销其他已完成周期。
+侧边栏的“模型训练”页面选择当前币种后可同时选择多个周期。后端会在一个持久任务中逐周期训练，各周期独立验证、晋级并保存在 `prediction/models/<周期>/<币种>/`；刷新页面会重新读取任务状态。任务状态和最近日志默认保存在 `prediction/validation/training-state.json` 与 `training.log`，可用 `PREDICTION_TRAINING_STATE_FILE`、`PREDICTION_TRAINING_LOG_FILE` 更改位置。各周期结果相互独立，单个周期失败不会撤销其他已完成周期。
 
 采集会复用 `data/<币种>-<周期>.csv`，先补最新 K 线，再补全已有历史缺口；每页成功后原子写入检查点，便于失败后续跑。Binance 限流、服务器错误和网络超时会进行退避重试，次数可由 `PREDICTION_COLLECT_RETRIES` 配置。训练页面会显示当前周期、币种、采集阶段和周期结果。关闭浏览器不影响后端 worker；若 worker 在后端重启期间已退出，状态会标记为中断并保留日志。
 

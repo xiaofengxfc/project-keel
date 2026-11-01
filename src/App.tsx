@@ -16,7 +16,7 @@ type Trend = { id: number; start: { time: number; price: number }; end: { time: 
 type Health = { privateApiConfigured: boolean; tradingEnabled: boolean; aiConfigured: boolean; predictionConfigured: boolean; environment?: string; websocketBaseUrl?: string }
 type TrainingMetrics = { accuracy?: number; balancedAccuracy?: number; macroF1?: number; confidenceCoverage?: number; selectiveAccuracy?: number; brier?: number; testSamples?: number }
 type TrainingIntervalResult = { status?: string; phase?: string; metrics?: TrainingMetrics; error?: string | null; output?: string; notice?: string }
-type TrainingStatus = { jobId?: string; running: boolean; phase?: string; stage?: string; currentInterval?: Interval; currentSymbol?: string; symbolIndex?: number; symbolCount?: number; pagesFetched?: number; rowsFetched?: number; intervals?: Interval[]; completedIntervals?: Interval[]; finishedIntervals?: Interval[]; intervalResults?: Record<string, TrainingIntervalResult>; results?: Record<string, TrainingIntervalResult>; output?: string; error?: string | null; startedAt?: number; finishedAt?: number; interval?: Interval; symbols?: string[]; metrics?: TrainingMetrics }
+type TrainingStatus = { jobId?: string; running: boolean; phase?: string; stage?: string; currentInterval?: Interval; currentSymbol?: string; pagesFetched?: number; rowsFetched?: number; intervals?: Interval[]; completedIntervals?: Interval[]; finishedIntervals?: Interval[]; intervalResults?: Record<string, TrainingIntervalResult>; results?: Record<string, TrainingIntervalResult>; output?: string; error?: string | null; startedAt?: number; finishedAt?: number; interval?: Interval; metrics?: TrainingMetrics }
 type ForwardValidationMetricSet = { predictions: number; settled: number; pending: number; accuracy: number | null; balancedAccuracy: number | null; brier: number | null; byClass?: Record<string, { actual: number; recall: number }> }
 type ForwardValidationMetrics = ForwardValidationMetricSet & { byModelVersion?: Record<string, ForwardValidationMetricSet> }
 type MarketQuote = { price: number; change: number }
@@ -306,8 +306,6 @@ function App() {
   const [predictionError, setPredictionError] = useState('')
   const predictionRequestKeyRef = useRef('')
   const [trainingIntervals, setTrainingIntervals] = useState<Interval[]>(['1h'])
-  const [trainingSymbolCount, setTrainingSymbolCount] = useState('4')
-  const [trainingSymbols, setTrainingSymbols] = useState('')
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ running: false })
   const [trainingRequestError, setTrainingRequestError] = useState('')
   const [trainingStatusError, setTrainingStatusError] = useState('')
@@ -1241,31 +1239,26 @@ function App() {
 
   const startModelTraining = async () => {
     if (trainingStatus.running) return
-    const symbolCount = Number(trainingSymbolCount)
     const intervals = modelTrainingIntervals.map(({ value }) => value).filter((value) => trainingIntervals.includes(value))
-    const symbols = [...new Set(trainingSymbols.split(',').map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))]
+    const symbol = active.trim().toUpperCase()
     if (!intervals.length) {
       setTrainingRequestError('请至少选择一个训练周期。')
       return
     }
-    if (!Number.isInteger(symbolCount) || symbolCount < 2 || symbolCount > 30) {
-      setTrainingRequestError('请输入 2 到 30 之间的整数币种数量。')
-      return
-    }
-    if (symbols.length > symbolCount || symbols.some((symbol) => !/^[A-Z0-9]{3,20}$/.test(symbol))) {
-      setTrainingRequestError(`手动币种格式无效，且不能多于目标数量 ${symbolCount}。`)
+    if (!symbol || !/^[A-Z0-9]{3,20}$/.test(symbol)) {
+      setTrainingRequestError('请先在左侧搜索并选择一个有效币种。')
       return
     }
     setTrainingRequestError('')
     setTrainingStatusError('')
     trainingSubmitInFlightRef.current = true
-    setTrainingStatus({ running: true, phase: 'running', stage: '正在提交训练任务…', intervals, interval: intervals[0], symbols })
+    setTrainingStatus({ running: true, phase: 'running', stage: '正在提交训练任务…', intervals, interval: intervals[0] })
     let receivedResponse = false
     try {
       const response = await fetch('/api/prediction/train', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intervals, interval: intervals[0], symbolCount, symbols }),
+        body: JSON.stringify({ intervals, interval: intervals[0], symbol }),
       })
       receivedResponse = true
       const payload = await response.json() as TrainingStatus & { error?: string }
@@ -1274,7 +1267,7 @@ function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : '模型训练启动失败'
       if (receivedResponse) {
-        setTrainingStatus({ running: false, phase: 'failed', error: message, intervals, interval: intervals[0], symbols })
+        setTrainingStatus({ running: false, phase: 'failed', error: message, intervals, interval: intervals[0] })
         setTrainingRequestError(message)
       } else {
         // The server may have accepted the job before the connection failed.
@@ -1316,11 +1309,6 @@ function App() {
   const trainingBadgeLabel = trainingStatus.running ? '训练中' : trainingStatus.phase === 'partial' ? '部分完成' : trainingStatus.phase === 'completed' ? '已完成' : trainingStatus.phase === 'not-promoted' ? '未晋级' : trainingStatus.phase === 'stopped' ? '已停止' : trainingStatus.phase === 'failed' ? '未完成' : '等待训练'
   const stageLabels: Record<string, string> = { starting: '正在准备任务', collecting: '正在采集历史 K 线', preparing: '正在准备训练特征', fitting: '正在拟合候选模型', training: '正在训练模型', validating: '正在评估候选模型', exporting: '正在导出模型文件', promoting: '正在保存并加载模型', stopping: '正在停止训练', 'not-promoted': '候选模型未晋级', completed: '当前周期已完成', failed: '当前周期失败', stopped: '训练已停止', interrupted: '训练进程已中断', finished: '任务已结束' }
   const trainingStageLabel = trainingStatus.stage ? stageLabels[trainingStatus.stage] ?? trainingStatus.stage : (trainingStatus.phase === 'running' ? '任务正在运行' : '')
-  const trainingDataProgress = trainingStatus.stage === 'fitting'
-    ? `已准备 ${trainingStatus.rowsFetched ?? 0} 条训练样本`
-    : trainingStatus.stage === 'preparing'
-      ? '正在构造训练特征'
-      : `已获取 ${trainingStatus.rowsFetched ?? 0} 根 K 线`
   const intervalResultPhase = (result: TrainingIntervalResult | undefined) => result?.status ?? result?.phase
   const resultStatusLabel = (result: TrainingIntervalResult | undefined, value: Interval) => {
     const phase = intervalResultPhase(result)
@@ -1334,7 +1322,7 @@ function App() {
   }
   const trainingPage = <section className="training-page panel">
     <div className="training-page-header">
-      <div><span className="eyebrow">LOCAL MODEL WORKSHOP</span><h1>通用 K 线模型训练</h1><p>从 Binance 当前可交易的 USDT 永续合约中随机选币训练通用模型。可顺序训练多个周期，每个周期独立验证和晋级。</p></div>
+      <div><span className="eyebrow">LOCAL MODEL WORKSHOP</span><h1>单币种 K 线模型训练</h1><p>针对当前选中的 Binance USDT 永续合约训练专属模型。可顺序训练多个周期，每个周期独立验证和晋级。</p></div>
       <span className={`training-status-badge ${trainingStatus.running ? 'running' : trainingStatus.phase === 'completed' || trainingStatus.phase === 'partial' ? 'completed' : trainingStatus.phase === 'not-promoted' || trainingStatus.phase === 'failed' || trainingStatus.phase === 'stopped' ? 'failed' : ''}`}><i />{trainingBadgeLabel}</span>
     </div>
     <div className="training-page-grid">
@@ -1345,23 +1333,22 @@ function App() {
             <legend>训练周期（可多选）</legend>
             {modelTrainingIntervals.map(({ value, label, horizon }) => <label key={value}><input type="checkbox" checked={trainingIntervals.includes(value)} onChange={(event) => setTrainingIntervals((current) => event.target.checked ? [...new Set([...current, value])] : current.filter((item) => item !== value))} /><span>{label}<small>预测未来 {horizon}</small></span></label>)}
           </fieldset>
-          <label>随机抽取数量<input type="number" min="2" max="30" step="1" value={trainingSymbolCount} onChange={(event) => setTrainingSymbolCount(event.target.value)} disabled={trainingStatus.running} /></label>
-          <label>手动指定币种（可选）<input value={trainingSymbols} onChange={(event) => setTrainingSymbols(event.target.value)} disabled={trainingStatus.running} placeholder="留空则全部随机；也可填写 BTCUSDT,ETHUSDT" /></label>
-          <small>数量为 2–30。手动输入的交易对会保留，剩余名额从其他可交易币种中随机补足；手动币种数不能超过设定数量。多周期任务会逐个周期顺序执行。</small>
+          <label>当前训练币种<input value={active || '请先在左侧搜索并选择币种'} readOnly disabled /></label>
+          <small>训练只使用当前选中的币种，不会随机补充其他币种。多周期任务会逐个周期顺序执行。</small>
         </div>
-        <button type="button" className="training-start-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running || trainingStopInFlight}>{trainingStatus.running ? '模型正在训练…' : '开始训练模型'}</button>
+        <button type="button" className="training-start-button" onClick={() => void startModelTraining()} disabled={trainingStatus.running || trainingStopInFlight || !active}>{trainingStatus.running ? '模型正在训练…' : '开始训练模型'}</button>
         <button type="button" className="training-stop-button" onClick={() => void stopModelTraining()} disabled={!trainingStatus.running || trainingStopInFlight}>{trainingStopInFlight ? '正在停止…' : '停止训练'}</button>
         {(trainingRequestError || trainingStatus.error || trainingStatusError) && <div className="training-page-error" role="alert">{trainingRequestError || trainingStatus.error || trainingStatusError}</div>}
       </section>
       <section className="training-run-card">
         <div className="training-section-heading"><span>02</span><div><h2>训练进度与结果</h2><p>训练完成后会自动验证并尝试热加载</p></div></div>
-        {trainingStatus.running ? <div className="training-progress" role="status"><i /><div><strong>{trainingStatus.currentInterval ? `正在处理 ${trainingStatus.currentInterval} 周期模型` : '正在准备训练任务'}</strong><span>{trainingStageLabel}{trainingStatus.currentSymbol ? ` · 当前币种 ${trainingStatus.currentSymbol}` : ''}</span>{trainingStatus.symbolCount !== undefined && <span>币种进度：{trainingStatus.symbolIndex ?? 0}/{trainingStatus.symbolCount} · {trainingDataProgress}</span>}<span>{trainingStatus.symbols?.length ? `训练币种：${trainingStatus.symbols.join(' · ')}` : '正在随机选取币种'}</span><span>周期进度：{trainingStatus.finishedIntervals?.length ?? trainingStatus.completedIntervals?.length ?? 0}/{statusIntervals.length} 已结束 · {trainingStatus.completedIntervals?.length ?? 0} 个已晋级</span></div></div>
+        {trainingStatus.running ? <div className="training-progress" role="status"><i /><div><strong>{trainingStatus.currentInterval ? `正在处理 ${trainingStatus.currentInterval} 周期模型` : '正在准备训练任务'}</strong><span>{trainingStageLabel}{trainingStatus.currentSymbol ? ` · 当前币种 ${trainingStatus.currentSymbol}` : ''}</span><span>周期进度：{trainingStatus.finishedIntervals?.length ?? trainingStatus.completedIntervals?.length ?? 0}/{statusIntervals.length} 已结束 · {trainingStatus.completedIntervals?.length ?? 0} 个已晋级</span></div></div>
           : trainingStatus.phase === 'completed' ? <div className="training-page-result" role="status"><strong>所选周期训练任务已结束</strong><small>每个周期的验证和模型晋级结果如下。</small></div>
             : trainingStatus.phase === 'not-promoted' ? <div className="training-idle failed" role="status">训练已完成，但候选模型未能晋级；现有模型保持不变。请查看周期结果与评估指标。</div>
             : trainingStatus.phase === 'partial' ? <div className="training-idle failed" role="status">部分周期已完成，至少一个周期失败或未能晋级；请查看各周期结果与日志。</div>
               : trainingStatus.phase === 'stopped' ? <div className="training-idle" role="status">训练已停止；已保存的 K 线数据和模型文件保持不变。</div>
               : trainingStatus.phase === 'failed' ? <div className="training-idle failed" role="status">训练任务失败。请查看下方阶段错误和详细日志。</div>
-                : <div className="training-idle">尚未启动训练。模型文件会分别保存在 <code>prediction/models/&lt;周期&gt;</code>。</div>}
+                : <div className="training-idle">尚未启动训练。模型文件会分别保存在 <code>prediction/models/&lt;周期&gt;/&lt;币种&gt;</code>。</div>}
         <div className="training-interval-results">{statusIntervals.map((value) => {
           const result = intervalResults[value]
           const label = modelTrainingIntervals.find(({ value: option }) => option === value)?.label ?? value
@@ -1381,10 +1368,10 @@ function App() {
             </>}
       </section>
     </div>
-    <div className="training-page-note"><strong>模型发布说明</strong><span>候选模型需通过最低测试样本检查；同特征体系下会在同一时间留出集比较 Brier、平衡准确率和宏 F1。界面显示各模型版本的前向验证结果。当前时间留出测试覆盖已采集币种，不代表对未见币种的泛化或未来表现保证。</span></div>
+    <div className="training-page-note"><strong>模型发布说明</strong><span>候选模型需通过最低测试样本检查；同一币种和周期下会在时间留出集比较 Brier、平衡准确率和宏 F1。没有训练过的币种不会使用其他币种模型代替。</span></div>
   </section>
   const predictionPanel = <div className="prediction-card prediction-card-main">
-    <div className="prediction-card-head"><strong>通用 K 线预测</strong><small>{prediction?.model ?? 'LightGBM / ONNX'}</small></div>
+    <div className="prediction-card-head"><strong>单币种 K 线预测</strong><small>{prediction?.model ?? 'LightGBM / ONNX'}</small></div>
     {!health.predictionConfigured ? <small className="prediction-muted">本地预测服务未连接。</small>
       : predictionLoading ? <small className="prediction-muted">正在计算最新已收盘 K 线…</small>
         : predictionError ? <small className="prediction-error">{predictionError}</small>
@@ -1431,7 +1418,7 @@ function App() {
         onOpenMarkets={() => { setWorkspaceView('markets'); setMobileMarketsOpen(false) }}
       />
       {workspaceView === 'training' ? trainingPage : <>
-      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><span className="prediction-header-label">通用预测 · {prediction ? (prediction.direction === 'UP' ? '上涨' : prediction.direction === 'DOWN' ? '下跌' : '信号不足') : predictionError ? '方向信号暂不可用' : '等待模型'}</span><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}{predictionPanel}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small><span className="toolbar-spacer" /><span className={`chart-status ${marketTransport === 'websocket' || marketTransport === 'rest' ? 'online' : ''}`}><i />{marketTransportLabel}{marketTransport === 'websocket' ? ` · ${chartPaneCount} 个指标窗` : ''}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}>{prediction && <div className="prediction-chart-overlay" aria-label="当前模型概率"><div><strong>预测概率</strong><small>未来 {prediction.horizonBars} 根 {prediction.interval} K 线</small></div><span className="prediction-chart-up">上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span className="prediction-chart-down">下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span className="prediction-chart-neutral">中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>}<LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期' : '手动周期'} · 通用预测 · Binance USDⓈ-M · {marketTransport === 'websocket' ? '实时' : marketTransport === 'rest' ? 'REST补偿' : '等待连接'}</span></div></section>
+      <section className="chart-section panel"><div className="chart-head"><div className="pair-title"><span className="coin-icon large" style={{ background: selected.color }}>{selected.icon}</span><div><span className="prediction-header-label">单币种预测 · {prediction ? (prediction.direction === 'UP' ? '上涨' : prediction.direction === 'DOWN' ? '下跌' : '信号不足') : predictionError ? '方向信号暂不可用' : '等待模型'}</span><h1>{active ? active.replace(activeQuoteAsset, "") : '选择币种'}<small>{active ? `/ ${activeQuoteAsset} · 永续` : '· 搜索并收藏币种开始'}</small></h1><div className="live-price">{formatPrice(last)} <span className={activeChange !== null && activeChange < 0 ? 'down' : 'up'}>{activeChange !== null ? `${activeChange >= 0 ? '+' : ''}${activeChange.toFixed(2)}%` : '—'}</span></div></div></div><div className="chart-meta">{(['15m', '1h', '4h', '1d'] as Interval[]).map((value) => <button key={value} className={interval === value && !autoTimeframe ? 'time-active' : ''} onClick={() => { setAutoTimeframe(false); setInterval(value) }}>{value.toUpperCase()}</button>)}<span className="divider" /><button type="button" className={indicatorsOpen ? 'selected' : ''} onClick={() => setIndicatorsOpen((open) => !open)}>⌁ 指标</button><div className="chart-more-wrap"><button type="button" aria-label="更多图表选项" aria-expanded={moreActionsOpen} onClick={() => setMoreActionsOpen((open) => !open)}>⋮</button>{moreActionsOpen && <div className="chart-more-menu"><button type="button" onClick={() => { setIndicatorsOpen(true); setMoreActionsOpen(false) }}>指标设置</button><button type="button" onClick={() => { setChartIndicators(DEFAULT_CHART_INDICATORS); setMoreActionsOpen(false) }}>恢复默认指标</button></div>}</div></div></div>{indicatorPanel}{predictionPanel}<div className="chart-toolbar"><button className={tool === 'cursor' ? 'selected' : ''} onClick={() => setTool('cursor')}>↖ 选择</button><button className={tool === 'horizontal' ? 'selected' : ''} onClick={() => setTool('horizontal')}>― 水平线</button><button className={tool === 'trend' ? 'selected' : ''} onClick={() => setTool('trend')}>╱ 手动画线</button><small className="chart-delete-hint">选择工具下双击标注删除</small><span className="toolbar-spacer" /><span className={`chart-status ${marketTransport === 'websocket' || marketTransport === 'rest' ? 'online' : ''}`}><i />{marketTransportLabel}{marketTransport === 'websocket' ? ` · ${chartPaneCount} 个指标窗` : ''}</span></div><div className="indicator-legend">{indicatorLegend}</div><div className="chart-wrap" style={{ '--indicator-extra-height': `${chartPaneCount * 80}px` } as React.CSSProperties}>{prediction && <div className="prediction-chart-overlay" aria-label="当前模型概率"><div><strong>预测概率</strong><small>未来 {prediction.horizonBars} 根 {prediction.interval} K 线</small></div><span className="prediction-chart-up">上涨 {Math.round(prediction.probabilityUp * 100)}%</span><span className="prediction-chart-down">下跌 {Math.round(prediction.probabilityDown * 100)}%</span><span className="prediction-chart-neutral">中性 {Math.round(prediction.probabilityNeutral * 100)}%</span></div>}<LiveChart key={`${active}-${interval}`} data={chartCandles} marketKey={`${active}:${interval}`} currentPrice={last} trades={chartTrades} indicators={chartIndicatorValues} enabledIndicators={chartIndicators} levels={chartLines} trends={trends} tool={tool} levelLabel={levelLabel} onAddLevel={(value) => { updateLines([...lines, { id: Date.now(), price: value, label: '手动标记', color: '#7c8794' }]); setTool('cursor') }} onAddTrend={addTrend} onRemoveLevel={removeLine} onRemoveTrend={(id) => updateTrends(trends.filter((trend) => trend.id !== id))} onLoadOlder={loadOlderCandles} />{loading && active && <div className="chart-empty">正在读取 Binance {interval.toUpperCase()} K 线…</div>}{!active && <div className="chart-empty">请在左侧搜索并收藏币种，然后选择查看行情。</div>}{active && !loading && chartCandles.length === 0 && <div className="chart-empty">暂时没有 K 线数据<br /><small>请检查网络连接状态</small></div>}</div><div className="chart-footer"><span>{loadingOlderCandles ? '正在加载更早的 K 线…' : historyError || (hasOlderCandles ? '向左拖动图表，自动加载更早的 K 线' : '已到可用历史数据起点')} · 共 {candles.length.toLocaleString()} 根 {interval.toUpperCase()}</span><span>{autoTimeframe ? '自动周期' : '手动周期'} · 单币种预测 · Binance USDⓈ-M · {marketTransport === 'websocket' ? '实时' : marketTransport === 'rest' ? 'REST补偿' : '等待连接'}</span></div></section>
       <aside id="trade-panel" className="trade-panel panel">
         <div className="tabs"><button className={tab === 'order' ? 'active' : ''} onClick={() => setTab('order')}>下单</button><button className={tab === 'ai' ? 'active' : ''} onClick={() => setTab('ai')}>AI 解释层 <span className="new-dot" /></button></div>
         {tab === 'order' ? <div className="order-content">

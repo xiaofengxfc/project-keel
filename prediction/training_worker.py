@@ -172,7 +172,7 @@ def final_job_phase(results: dict[str, dict[str, Any]], intervals: list[str]) ->
 
 def run_interval(
     interval: str,
-    symbols: list[str],
+    symbol: str,
     job_id: str,
     state_path: Path,
     progress_path: Path,
@@ -188,8 +188,8 @@ def run_interval(
     state["rowsFetched"] = 0
     interval_results = state.setdefault("intervalResults", {})
     interval_results[interval] = result
-    atomic_json(progress_path, {"jobId": job_id, "phase": "collecting", "interval": interval, "currentSymbol": None, "symbolIndex": 0, "symbolCount": len(symbols), "pagesFetched": 0, "rowsFetched": 0})
-    update_job(state_path, state, log_path, f"[{interval}] 开始训练：{', '.join(symbols)}")
+    atomic_json(progress_path, {"jobId": job_id, "phase": "collecting", "interval": interval, "currentSymbol": None, "symbolIndex": 0, "symbolCount": 1, "pagesFetched": 0, "rowsFetched": 0})
+    update_job(state_path, state, log_path, f"[{interval}] 开始训练：{symbol}")
 
     environment = os.environ.copy()
     environment["PREDICTION_TRAINING_PROGRESS_FILE"] = str(progress_path)
@@ -198,7 +198,7 @@ def run_interval(
     # process to the same encoding so Windows' active code page cannot turn
     # Chinese progress messages into replacement characters.
     environment["PYTHONIOENCODING"] = "utf-8"
-    command = [sys.executable, "-u", "-m", "prediction.auto_train", "--symbols", ",".join(symbols), "--interval", interval]
+    command = [sys.executable, "-u", "-m", "prediction.auto_train", "--symbol", symbol, "--interval", interval]
     output_lines: list[str] = []
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=environment, **silent_process_options())
@@ -214,11 +214,6 @@ def run_interval(
     atomic_json(state_path, state)
 
     assert process.stdout is not None
-    progress_symbol_index: int | None = None
-    progress_rows_current = 0
-    progress_pages_current = 0
-    progress_rows_completed = 0
-    progress_pages_completed = 0
     progress_phase: str | None = None
     last_progress_error: str | None = None
     for raw_line in process.stdout:
@@ -242,42 +237,22 @@ def run_interval(
         if progress:
             incoming_phase = progress.get("phase")
             if isinstance(incoming_phase, str) and incoming_phase != progress_phase:
-                # Candle collection and feature/model stages use different
-                # counters. Do not carry a per-symbol collection counter into
-                # the later training phases.
                 progress_phase = incoming_phase
-                progress_symbol_index = None
-                progress_rows_current = 0
-                progress_pages_current = 0
-                progress_rows_completed = 0
-                progress_pages_completed = 0
+                # Collection pages and training sample counts use different
+                # units, so start each stage from a fresh counter.
+                state["rowsFetched"] = 0
+                state["pagesFetched"] = 0
             if progress.get("phase") == "failed":
                 if isinstance(progress.get("error"), str) and progress["error"].strip():
                     last_progress_error = progress["error"].strip()
             elif progress.get("phase") in {"collecting", "preparing", "fitting", "training", "validating", "exporting", "promoting"}:
                 last_progress_error = None
-            incoming_symbol_index = progress.get("symbolIndex")
-            if isinstance(incoming_symbol_index, int):
-                if progress_symbol_index is not None and incoming_symbol_index > progress_symbol_index:
-                    progress_rows_completed += progress_rows_current
-                    progress_pages_completed += progress_pages_current
-                    progress_rows_current = 0
-                    progress_pages_current = 0
-                progress_symbol_index = incoming_symbol_index
             incoming_rows = progress.get("rowsFetched")
             incoming_pages = progress.get("pagesFetched")
             if isinstance(incoming_rows, int):
-                if isinstance(incoming_symbol_index, int):
-                    progress_rows_current = max(progress_rows_current, incoming_rows)
-                    progress["rowsFetched"] = progress_rows_completed + progress_rows_current
-                else:
-                    progress["rowsFetched"] = max(state.get("rowsFetched", 0), incoming_rows)
+                progress["rowsFetched"] = max(state.get("rowsFetched", 0), incoming_rows)
             if isinstance(incoming_pages, int):
-                if isinstance(incoming_symbol_index, int):
-                    progress_pages_current = max(progress_pages_current, incoming_pages)
-                    progress["pagesFetched"] = progress_pages_completed + progress_pages_current
-                else:
-                    progress["pagesFetched"] = max(state.get("pagesFetched", 0), incoming_pages)
+                progress["pagesFetched"] = max(state.get("pagesFetched", 0), incoming_pages)
             for field in ("phase", "currentSymbol", "symbolIndex", "symbolCount", "pagesFetched", "rowsFetched", "message"):
                 if field in progress:
                     state[field if field != "phase" else "stage"] = progress[field]
@@ -299,11 +274,11 @@ def run_interval(
         return result
 
     model_root = Path(os.getenv("PREDICTION_MODEL_DIR", "prediction/models"))
-    metadata_path = model_root / interval / "metadata.json"
+    metadata_path = model_root / interval / symbol / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("symbol") != "*" or metadata.get("interval") != interval:
-            raise RuntimeError("训练产物不是预期的通用周期模型")
+        if metadata.get("symbol") != symbol or metadata.get("interval") != interval:
+            raise RuntimeError("训练产物不是预期的单币种周期模型")
         result.update({"phase": "completed", "metrics": metadata.get("metrics", {}), "finishedAt": int(time.time() * 1000)})
         reload_notice = request_reload(os.getenv("PREDICTION_SERVICE_URL", "http://127.0.0.1:8790/predict"))
         if reload_notice:
@@ -356,10 +331,13 @@ def record_worker_failure(state_path: Path, log_path: Path, error: BaseException
 
 def run_worker(args: argparse.Namespace) -> int:
     intervals = list(dict.fromkeys(item.strip() for item in args.intervals.split(",") if item.strip()))
-    symbols = list(dict.fromkeys(item.strip().upper() for item in args.symbols.split(",") if item.strip()))
-    if not intervals or any(interval not in SUPPORTED_INTERVALS for interval in intervals) or len(symbols) < 2:
+    symbol = args.symbol.strip().upper()
+    if not intervals or any(interval not in SUPPORTED_INTERVALS for interval in intervals) or not re.fullmatch(r"[A-Z0-9]{3,20}", symbol):
         append_log(args.log_file, "训练 worker 参数无效")
         return 2
+    # Persist the existing list-shaped state field for UI compatibility while
+    # keeping the execution path explicitly single-symbol.
+    symbols = [symbol]
 
     state = load_state(args.state_file)
     if state.get("jobId") != args.job_id:
@@ -374,7 +352,7 @@ def run_worker(args: argparse.Namespace) -> int:
     failures: list[str] = []
     for index, interval in enumerate(intervals, start=1):
         state["intervalIndex"] = index
-        result = run_interval(interval, symbols, args.job_id, args.state_file, args.progress_file, args.log_file, state)
+        result = run_interval(interval, symbol, args.job_id, args.state_file, args.progress_file, args.log_file, state)
         if result["phase"] == "failed":
             failures.append(f"{interval}: {result.get('error') or '候选模型未晋级'}")
         update_interval_counters(state)
@@ -406,7 +384,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Persistent multi-interval prediction training worker")
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--intervals", required=True, help="Comma-separated intervals")
-    parser.add_argument("--symbols", required=True, help="Comma-separated trading pairs")
+    parser.add_argument("--symbol", required=True, help="Single trading pair")
     parser.add_argument("--state-file", required=True, type=Path)
     parser.add_argument("--progress-file", required=True, type=Path)
     parser.add_argument("--log-file", required=True, type=Path)

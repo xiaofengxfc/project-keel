@@ -88,7 +88,7 @@ class TrainingWorkerTests(unittest.TestCase):
             atomic_json(state_path, {"jobId": "job-1", "running": True, "phase": "running", "workerPid": 123})
             argv = [
                 "training_worker", "--job-id", "job-1", "--intervals", "15m",
-                "--symbols", "BTCUSDT,ETHUSDT", "--state-file", str(state_path),
+                "--symbol", "BTCUSDT", "--state-file", str(state_path),
                 "--progress-file", str(root / "progress.json"), "--log-file", str(log_path),
             ]
             with patch.object(sys, "argv", argv), patch("prediction.training_worker.run_worker", side_effect=RuntimeError("boom")):
@@ -154,13 +154,13 @@ class TrainingWorkerTests(unittest.TestCase):
                 return FakeProcess()
 
             with patch("prediction.training_worker.subprocess.Popen", side_effect=start_process):
-                run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+                run_interval("15m", "BTCUSDT", "job-1", state_path, progress_path, log_path, state)
 
             self.assertEqual(state["rowsFetched"], 200)
             self.assertEqual(state["pagesFetched"], 2)
             self.assertEqual(process_kwargs["env"]["PYTHONIOENCODING"], "utf-8")
 
-    def test_worker_keeps_candle_progress_when_next_symbol_resets_local_counter(self):
+    def test_worker_keeps_single_symbol_candle_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state_path = root / "state.json"
@@ -169,7 +169,7 @@ class TrainingWorkerTests(unittest.TestCase):
             state = {"jobId": "job-1", "intervalResults": {}}
             lines = [
                 "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 1, "rowsFetched": 100, "pagesFetched": 1}),
-                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 2, "currentSymbol": "ETHUSDT", "rowsFetched": 0, "pagesFetched": 0}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "currentSymbol": "BTCUSDT", "rowsFetched": 0, "pagesFetched": 0}),
             ]
 
             class FakeProcess:
@@ -179,7 +179,7 @@ class TrainingWorkerTests(unittest.TestCase):
                     return 1
 
             with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
-                run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+                run_interval("15m", "BTCUSDT", "job-1", state_path, progress_path, log_path, state)
 
             self.assertEqual(state["rowsFetched"], 100)
             self.assertEqual(state["pagesFetched"], 1)
@@ -193,9 +193,8 @@ class TrainingWorkerTests(unittest.TestCase):
             state = {"jobId": "job-1", "intervalResults": {}}
             lines = [
                 "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 1, "rowsFetched": 100, "pagesFetched": 1}),
-                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 2, "rowsFetched": 200, "pagesFetched": 2}),
-                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "preparing", "symbolIndex": 2, "rowsFetched": 1234, "pagesFetched": 0}),
-                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "fitting", "symbolIndex": 2, "rowsFetched": 1234, "pagesFetched": 0}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "preparing", "symbolIndex": 1, "rowsFetched": 1234, "pagesFetched": 0}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "fitting", "symbolIndex": 1, "rowsFetched": 1234, "pagesFetched": 0}),
             ]
 
             class FakeProcess:
@@ -205,7 +204,7 @@ class TrainingWorkerTests(unittest.TestCase):
                     return 1
 
             with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
-                run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+                run_interval("15m", "BTCUSDT", "job-1", state_path, progress_path, log_path, state)
 
             self.assertEqual(state["rowsFetched"], 1234)
             self.assertEqual(state["pagesFetched"], 0)
@@ -231,7 +230,7 @@ class TrainingWorkerTests(unittest.TestCase):
                     return 1
 
             with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
-                result = run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+                result = run_interval("15m", "BTCUSDT", "job-1", state_path, progress_path, log_path, state)
 
             self.assertEqual(result["phase"], "failed")
             self.assertIn("Binance K 线请求失败", result["error"])
@@ -260,7 +259,7 @@ class TrainingWorkerTests(unittest.TestCase):
                     return 1
 
             with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
-                result = run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+                result = run_interval("15m", "BTCUSDT", "job-1", state_path, progress_path, log_path, state)
 
             self.assertIn("第二次采集失败", result["error"])
             self.assertNotIn("第一次采集失败", result["error"])

@@ -287,56 +287,42 @@ class ModelBundle:
 class ModelState:
     def __init__(self) -> None:
         self.model_root = Path(os.getenv("PREDICTION_MODEL_DIR", "prediction/models"))
-        self.bundles: dict[str, ModelBundle] = {}
+        self.bundles: dict[tuple[str, str], ModelBundle] = {}
         self.load_error = "模型尚未加载"
         self.load()
 
     def load(self) -> str | None:
-        loaded_bundles: dict[str, ModelBundle] = {}
-        candidates: list[tuple[str, Path]] = [
-            (interval, self.model_root / interval)
-            for interval in ("15m", "1h", "4h", "1d")
-        ]
-        candidates.append(("*", self.model_root))
-        for key, model_dir in candidates:
-            if key in loaded_bundles or not model_dir.is_dir():
+        loaded_bundles: dict[tuple[str, str], ModelBundle] = {}
+        for interval in ("15m", "1h", "4h", "1d"):
+            interval_dir = self.model_root / interval
+            if not interval_dir.is_dir():
                 continue
-            bundle = ModelBundle(model_dir)
-            if bundle.ready:
-                loaded_bundles[key] = bundle
+            for model_dir in interval_dir.iterdir():
+                if not model_dir.is_dir() or model_dir.name.startswith(".") or model_dir.name.endswith(".previous"):
+                    continue
+                symbol = model_dir.name.upper()
+                if not re.fullmatch(r"[A-Z0-9]{3,20}", symbol):
+                    continue
+                bundle = ModelBundle(model_dir)
+                if bundle.ready and bundle.metadata.get("interval") == interval and str(bundle.metadata.get("symbol", "")).upper() == symbol:
+                    loaded_bundles[(interval, symbol)] = bundle
+        # Every reload replaces the complete snapshot. This prevents a model
+        # that was deleted or invalidated on disk from remaining available in
+        # memory for predictions.
+        self.bundles = loaded_bundles
         if loaded_bundles:
-            self.bundles = {**self.bundles, **loaded_bundles}
             self.load_error = ""
             return None
-        else:
-            # A failed hot reload must not take the last known-good model
-            # offline. Keep it available while reporting the reload failure.
-            error = f"未找到可用模型：请在 {self.model_root} 下生成 direction.onnx 和 metadata.json"
-            if not self.bundles:
-                self.load_error = error
-            return error
+        error = f"未找到可用单币种模型：请在 {self.model_root}/<周期>/<币种>/ 下生成 direction.onnx 和 metadata.json"
+        self.load_error = error
+        return error
 
     @property
     def ready(self) -> bool:
         return bool(self.bundles)
 
     def bundle_for(self, interval: str, symbol: str) -> ModelBundle | None:
-        # Prefer an interval-specific model. A legacy `current` model is only
-        # eligible when its metadata explicitly matches this request, so a
-        # stale single-symbol/1h model can never be applied to another coin or
-        # timeframe by accident.
-        for key in (interval, "*"):
-            bundle = self.bundles.get(key)
-            if bundle is None:
-                continue
-            expected_interval = bundle.metadata.get("interval")
-            if expected_interval not in (None, "*", interval):
-                continue
-            expected_symbol = str(bundle.metadata.get("symbol", "*")).upper()
-            if expected_symbol not in {"*", "ALL", symbol}:
-                continue
-            return bundle
-        return None
+        return self.bundles.get((interval, symbol.upper()))
 
 
 def apply_probability_temperature(probabilities: list[float], temperature: float) -> list[float]:
@@ -361,7 +347,7 @@ except Exception as error:  # Prediction remains available if the local metrics 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "ready": state.ready, "models": sorted(state.bundles), "error": state.load_error or None, "forwardValidation": validation_store is not None}
+    return {"ok": True, "ready": state.ready, "models": sorted(f"{interval}/{symbol}" for interval, symbol in state.bundles), "error": state.load_error or None, "forwardValidation": validation_store is not None}
 
 
 @app.get("/validation/metrics")
@@ -386,7 +372,7 @@ def reload_models(request: Request) -> dict[str, Any]:
     error = state.load()
     if error:
         raise HTTPException(status_code=503, detail=error)
-    return {"ok": True, "ready": state.ready, "models": sorted(state.bundles)}
+    return {"ok": True, "ready": state.ready, "models": sorted(f"{interval}/{symbol}" for interval, symbol in state.bundles)}
 
 
 @app.post("/predict")
@@ -406,10 +392,10 @@ def predict(request: PredictionRequest) -> dict[str, Any]:
         if len(closed) < minimum:
             raise HTTPException(status_code=422, detail=f"至少需要 {minimum} 根已收盘 K 线")
         expected_interval = bundle.metadata.get("interval")
-        if expected_interval not in (None, "*", request.interval):
+        if expected_interval != request.interval:
             raise HTTPException(status_code=422, detail=f"当前模型仅支持 {expected_interval} 周期")
         expected_symbol = bundle.metadata.get("symbol")
-        if expected_symbol and str(expected_symbol).upper() not in {"*", "ALL", symbol}:
+        if not expected_symbol or str(expected_symbol).upper() != symbol:
             raise HTTPException(status_code=422, detail=f"当前模型仅支持 {str(expected_symbol).upper()}，请为 {symbol} 训练对应模型")
         expected_horizon = int(bundle.metadata.get("horizonBars", request.horizonBars or 3))
         if request.horizonBars is not None and request.horizonBars != expected_horizon:
