@@ -314,6 +314,7 @@ function App() {
   const [trainingStopInFlight, setTrainingStopInFlight] = useState(false)
   const trainingStatusRequestInFlightRef = useRef(false)
   const trainingSubmitInFlightRef = useRef(false)
+  const trainingProgressRef = useRef<{ jobId: string | null; interval: string | null; rowsFetched: number; pagesFetched: number }>({ jobId: null, interval: null, rowsFetched: 0, pagesFetched: 0 })
   const trainingInterval = trainingIntervals[0] ?? '1h'
   const [forwardMetrics, setForwardMetrics] = useState<ForwardValidationMetrics | null>(null)
   const [forwardMetricsError, setForwardMetricsError] = useState('')
@@ -859,7 +860,24 @@ function App() {
         const status = await response.json() as TrainingStatus
         if (trainingSubmitInFlightRef.current) return
         if (!cancelled) {
-          setTrainingStatus(status)
+          const jobId = status.jobId ?? null
+          const interval = status.currentInterval ?? status.interval ?? null
+          const previousProgress = trainingProgressRef.current
+          if (jobId !== previousProgress.jobId || interval !== previousProgress.interval) {
+            trainingProgressRef.current = { jobId, interval, rowsFetched: status.rowsFetched ?? 0, pagesFetched: status.pagesFetched ?? 0 }
+          } else if (status.running) {
+            trainingProgressRef.current = {
+              jobId,
+              interval,
+              rowsFetched: Math.max(previousProgress.rowsFetched, status.rowsFetched ?? 0),
+              pagesFetched: Math.max(previousProgress.pagesFetched, status.pagesFetched ?? 0),
+            }
+          }
+          const progress = trainingProgressRef.current
+          setTrainingStatus({
+            ...status,
+            ...(status.running ? { rowsFetched: progress.rowsFetched, pagesFetched: progress.pagesFetched } : {}),
+          })
           setTrainingStatusError('')
           if (status.jobId && status.jobId !== trainingStatus.jobId && status.intervals?.length) {
             setTrainingIntervals(status.intervals.filter((value): value is Interval => ['15m', '1h', '4h', '1d'].includes(value)))
