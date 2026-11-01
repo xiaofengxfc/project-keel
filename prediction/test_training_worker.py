@@ -1,13 +1,95 @@
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from prediction.training_worker import atomic_json, final_job_phase, is_not_promoted, local_reload_url, load_progress, run_interval, short_error
+from prediction.training_worker import atomic_json, final_job_phase, is_not_promoted, local_reload_url, load_progress, main, record_worker_failure, run_interval, short_error
 
 
 class TrainingWorkerTests(unittest.TestCase):
+    def test_atomic_json_retries_transient_windows_replace_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            real_replace = os.replace
+            calls = 0
+
+            def replace_with_transient_lock(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise PermissionError(5, "Access is denied")
+                real_replace(source, destination)
+
+            with patch("prediction.training_worker.os.replace", side_effect=replace_with_transient_lock), patch("prediction.training_worker.time.sleep") as sleep:
+                atomic_json(path, {"phase": "running"})
+
+            self.assertEqual(calls, 3)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["phase"], "running")
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_atomic_json_cleans_temporary_file_after_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            temporary_paths = []
+
+            def replace_always_locked(source, destination):
+                temporary_paths.append(Path(source))
+                raise PermissionError(5, "Access is denied")
+
+            with patch("prediction.training_worker.os.replace", side_effect=replace_always_locked), patch("prediction.training_worker.time.sleep"):
+                with self.assertRaises(PermissionError):
+                    atomic_json(path, {"phase": "running"})
+
+            self.assertEqual(len(temporary_paths), 4)
+            self.assertTrue(all(not temporary.exists() for temporary in temporary_paths))
+            self.assertFalse(path.exists())
+
+    def test_unexpected_worker_failure_is_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            log_path = root / "training.log"
+            atomic_json(state_path, {
+                "jobId": "job-1", "running": True, "phase": "running",
+                "currentInterval": "15m", "currentSymbol": "BTCUSDT",
+                "intervalResults": {"15m": {"phase": "running", "error": None}},
+                "workerPid": 123,
+            })
+            try:
+                raise RuntimeError("unexpected training failure")
+            except RuntimeError as error:
+                record_worker_failure(state_path, log_path, error)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(state["running"])
+            self.assertEqual(state["phase"], "failed")
+            self.assertEqual(state["stage"], "worker-error")
+            self.assertEqual(state["intervalResults"]["15m"]["phase"], "failed")
+            self.assertEqual(state["finishedIntervals"], ["15m"])
+            self.assertNotIn("workerPid", state)
+            self.assertIn("RuntimeError: unexpected training failure", log_path.read_text(encoding="utf-8"))
+
+    def test_main_catches_unexpected_worker_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            log_path = root / "training.log"
+            atomic_json(state_path, {"jobId": "job-1", "running": True, "phase": "running", "workerPid": 123})
+            argv = [
+                "training_worker", "--job-id", "job-1", "--intervals", "15m",
+                "--symbols", "BTCUSDT,ETHUSDT", "--state-file", str(state_path),
+                "--progress-file", str(root / "progress.json"), "--log-file", str(log_path),
+            ]
+            with patch.object(sys, "argv", argv), patch("prediction.training_worker.run_worker", side_effect=RuntimeError("boom")):
+                self.assertEqual(main(), 1)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["stage"], "worker-error")
+            self.assertIn("RuntimeError: boom", state["error"])
+
     def test_progress_snapshot_is_atomic_json_and_job_scoped(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "progress.json"
@@ -47,6 +129,7 @@ class TrainingWorkerTests(unittest.TestCase):
                 "jobId": "job-1", "phase": "collecting", "interval": "15m",
                 "currentSymbol": "ETHUSDT", "pagesFetched": 2, "rowsFetched": 200,
             }
+            process_kwargs = {}
 
             class FakeProcess:
                 def __init__(self):
@@ -56,6 +139,7 @@ class TrainingWorkerTests(unittest.TestCase):
                     return 1
 
             def start_process(*_args, **_kwargs):
+                process_kwargs.update(_kwargs)
                 progress_path.write_text(json.dumps({
                     "jobId": "job-1", "phase": "collecting", "interval": "15m",
                     "currentSymbol": "BTCUSDT", "pagesFetched": 1, "rowsFetched": 100,
@@ -67,6 +151,7 @@ class TrainingWorkerTests(unittest.TestCase):
 
             self.assertEqual(state["rowsFetched"], 200)
             self.assertEqual(state["pagesFetched"], 2)
+            self.assertEqual(process_kwargs["env"]["PYTHONIOENCODING"], "utf-8")
 
     def test_only_local_prediction_endpoints_are_reloaded(self):
         self.assertEqual(local_reload_url("http://127.0.0.1:8790/predict"), "http://127.0.0.1:8790/reload")

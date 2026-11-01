@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,16 +21,37 @@ from typing import Any
 LOG_LIMIT = 12_000
 PROGRESS_PREFIX = "KEEL_TRAIN_PROGRESS "
 SUPPORTED_INTERVALS = {"15m", "1h", "4h", "1d"}
+ATOMIC_REPLACE_ATTEMPTS = 4
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, suffix=".tmp") as handle:
-        temporary = Path(handle.name)
-        json.dump(value, handle, ensure_ascii=False)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False, suffix=".tmp") as handle:
+            temporary = Path(handle.name)
+            json.dump(value, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        # Windows can briefly keep the destination open while the API reads
+        # the state file. Retry the atomic replacement instead of aborting the
+        # worker on a transient sharing violation.
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                temporary = None
+                break
+            except PermissionError:
+                if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(0.05 * (2**attempt))
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def is_not_promoted(return_code: int, output: str) -> bool:
@@ -166,6 +188,10 @@ def run_interval(
     environment = os.environ.copy()
     environment["PREDICTION_TRAINING_PROGRESS_FILE"] = str(progress_path)
     environment["PREDICTION_TRAINING_JOB_ID"] = job_id
+    # The progress protocol and log files are UTF-8.  Pin the child Python
+    # process to the same encoding so Windows' active code page cannot turn
+    # Chinese progress messages into replacement characters.
+    environment["PYTHONIOENCODING"] = "utf-8"
     command = [sys.executable, "-u", "-m", "prediction.auto_train", "--symbols", ",".join(symbols), "--interval", interval]
     output_lines: list[str] = []
     try:
@@ -241,16 +267,43 @@ def run_interval(
     return result
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Persistent multi-interval prediction training worker")
-    parser.add_argument("--job-id", required=True)
-    parser.add_argument("--intervals", required=True, help="Comma-separated intervals")
-    parser.add_argument("--symbols", required=True, help="Comma-separated trading pairs")
-    parser.add_argument("--state-file", required=True, type=Path)
-    parser.add_argument("--progress-file", required=True, type=Path)
-    parser.add_argument("--log-file", required=True, type=Path)
-    args = parser.parse_args()
+def record_worker_failure(state_path: Path, log_path: Path, error: BaseException) -> None:
+    """Best-effortly persist an unexpected worker exception for the UI."""
+    message = f"{type(error).__name__}: {error}"
+    try:
+        append_log(log_path, f"训练 worker 异常终止：{message}\n{traceback.format_exc().rstrip()}")
+    except OSError:
+        pass
 
+    state = load_state(state_path)
+    if not state:
+        return
+    current_interval = state.get("currentInterval")
+    interval_results = state.get("intervalResults")
+    if isinstance(interval_results, dict) and isinstance(current_interval, str):
+        current_result = interval_results.get(current_interval)
+        if isinstance(current_result, dict) and current_result.get("phase") == "running":
+            current_result.update({"phase": "failed", "error": message, "finishedAt": int(time.time() * 1000)})
+    update_interval_counters(state)
+    state.update({
+        "running": False,
+        "phase": "failed",
+        "stage": "worker-error",
+        "error": message,
+        "finishedAt": int(time.time() * 1000),
+        "currentSymbol": None,
+    })
+    state.pop("workerPid", None)
+    try:
+        atomic_json(state_path, state)
+    except Exception as persist_error:
+        try:
+            append_log(log_path, f"无法保存 worker 失败状态：{type(persist_error).__name__}: {persist_error}")
+        except OSError:
+            pass
+
+
+def run_worker(args: argparse.Namespace) -> int:
     intervals = list(dict.fromkeys(item.strip() for item in args.intervals.split(",") if item.strip()))
     symbols = list(dict.fromkeys(item.strip().upper() for item in args.symbols.split(",") if item.strip()))
     if not intervals or any(interval not in SUPPORTED_INTERVALS for interval in intervals) or len(symbols) < 2:
@@ -296,6 +349,22 @@ def main() -> int:
     successful = sum(1 for interval in intervals if results.get(interval, {}).get("phase") == "completed")
     append_log(args.log_file, f"任务完成：{state['phase']}，成功周期 {successful}/{len(intervals)}")
     return 1 if state["phase"] == "failed" else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Persistent multi-interval prediction training worker")
+    parser.add_argument("--job-id", required=True)
+    parser.add_argument("--intervals", required=True, help="Comma-separated intervals")
+    parser.add_argument("--symbols", required=True, help="Comma-separated trading pairs")
+    parser.add_argument("--state-file", required=True, type=Path)
+    parser.add_argument("--progress-file", required=True, type=Path)
+    parser.add_argument("--log-file", required=True, type=Path)
+    args = parser.parse_args()
+    try:
+        return run_worker(args)
+    except Exception as error:
+        record_worker_failure(args.state_file, args.log_file, error)
+        return 1
 
 
 if __name__ == "__main__":
