@@ -453,7 +453,6 @@ function App() {
     let socket: WebSocket | null = null
     let reconnectAttempt = 0
     let lastKlineMessageAt = 0
-    let lastSocketMessageAt = 0
     let socketOpenedAt = 0
     let socketStableTimer: ReturnType<typeof setTimeout> | undefined
     let reconnectCooldownUntil = 0
@@ -485,21 +484,32 @@ function App() {
     }
     const refreshLatestCandles = async () => {
       if (cancelled || refreshInFlight) return
+      // A healthy kline stream already delivers the live candle. Avoid opening
+      // a REST request on every refresh tick while the WebSocket is healthy;
+      // REST remains the fallback when the stream is still connecting or stale.
+      if (socket?.readyState === WebSocket.OPEN && lastKlineMessageAt > 0 && Date.now() - lastKlineMessageAt < KLINE_WATCHDOG_MS) {
+        if (refreshTimer) {
+          clearTimeout(refreshTimer)
+          refreshTimer = undefined
+        }
+        return
+      }
       refreshInFlight = true
       try {
         const rows = await requestKlines(active, interval, undefined, 2, true)
         if (cancelled) return
         mergeCandles(parseKlines(rows), true)
-        const lastSocketActivityAt = lastSocketMessageAt || lastKlineMessageAt || socketOpenedAt
-        if (!lastSocketActivityAt || Date.now() - lastSocketActivityAt >= KLINE_WATCHDOG_MS) setMarketTransport('rest')
+        const lastKlineActivityAt = lastKlineMessageAt || socketOpenedAt
+        if (!lastKlineActivityAt || Date.now() - lastKlineActivityAt >= KLINE_WATCHDOG_MS) setMarketTransport('rest')
       } catch {
-        const lastSocketActivityAt = lastSocketMessageAt || lastKlineMessageAt || socketOpenedAt
-        if (!cancelled && (!lastSocketActivityAt || Date.now() - lastSocketActivityAt >= KLINE_WATCHDOG_MS)) setMarketTransport('offline')
+        const lastKlineActivityAt = lastKlineMessageAt || socketOpenedAt
+        if (!cancelled && (!lastKlineActivityAt || Date.now() - lastKlineActivityAt >= KLINE_WATCHDOG_MS)) setMarketTransport('offline')
       } finally {
         refreshInFlight = false
         if (!cancelled) {
           if (refreshTimer) clearTimeout(refreshTimer)
-          refreshTimer = setTimeout(refreshLatestCandles, KLINE_REFRESH_MS[interval])
+          const streamHealthy = socket?.readyState === WebSocket.OPEN && lastKlineMessageAt > 0 && Date.now() - lastKlineMessageAt < KLINE_WATCHDOG_MS
+          refreshTimer = streamHealthy ? undefined : setTimeout(refreshLatestCandles, KLINE_REFRESH_MS[interval])
         }
       }
     }
@@ -508,8 +518,10 @@ function App() {
       .catch(() => { if (!cancelled) setCandles([]) })
       .finally(() => { if (!cancelled) setLoading(false) })
 
-      const streams = watchlist.filter((symbol) => availableSymbols.some((item) => item.symbol === symbol)).map((symbol) => `${symbol.toLowerCase()}@ticker`)
-    if (!streams.includes(`${active.toLowerCase()}@ticker`)) streams.push(`${active.toLowerCase()}@ticker`)
+      // The watchlist can contain many symbols. Subscribe only to the active
+      // ticker and kline; the 30-second ticker snapshot keeps other favorites
+      // updated without creating an oversized combined-stream URL.
+      const streams = [`${active.toLowerCase()}@ticker`]
     const streamBaseUrl = health.websocketBaseUrl
     const streamUrl = streamBaseUrl ? `${streamBaseUrl}/stream?streams=${[...streams, `${active.toLowerCase()}@kline_${interval}`].join('/')}` : ''
     const connect = () => {
@@ -518,7 +530,6 @@ function App() {
       socket.onopen = () => {
         socketOpenedAt = Date.now()
         lastKlineMessageAt = 0
-        lastSocketMessageAt = socketOpenedAt
         if (socketStableTimer) clearTimeout(socketStableTimer)
         socketStableTimer = setTimeout(() => {
           if (!cancelled && socket?.readyState === WebSocket.OPEN) reconnectAttempt = 0
@@ -526,7 +537,6 @@ function App() {
         if (!cancelled) setMarketTransport('connecting')
       }
       socket.onmessage = (event) => {
-        lastSocketMessageAt = Date.now()
         try {
           const envelope = JSON.parse(event.data) as { data?: { e?: string; s?: string; c?: string; P?: string; k?: { s?: string; i?: string; t: number; o: string; h: string; l: string; c: string; v?: string } }; s?: string; c?: string; P?: string; k?: { s?: string; i?: string; t: number; o: string; h: string; l: string; c: string; v?: string } }
           const data = (envelope.data ?? envelope) as typeof envelope
@@ -534,6 +544,10 @@ function App() {
             // 只接收当前交易对和周期，按开盘时间更新正在形成的K线。
             if (data.k.s?.toUpperCase() !== active || data.k.i !== interval) return
             lastKlineMessageAt = Date.now()
+            if (refreshTimer) {
+              clearTimeout(refreshTimer)
+              refreshTimer = undefined
+            }
             if (!cancelled) {
               setMarketTransport('websocket')
             }
@@ -569,8 +583,8 @@ function App() {
     connect()
     void refreshLatestCandles()
     watchdogTimer = window.setInterval(() => {
-      const lastSocketActivityAt = lastSocketMessageAt || socketOpenedAt
-      if (cancelled || !lastSocketActivityAt || Date.now() - lastSocketActivityAt < KLINE_WATCHDOG_MS) return
+      const lastKlineActivityAt = lastKlineMessageAt || socketOpenedAt
+      if (cancelled || !lastKlineActivityAt || Date.now() - lastKlineActivityAt < KLINE_WATCHDOG_MS) return
       setMarketTransport('rest')
       if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) socket.close()
     }, 3000)
@@ -583,7 +597,7 @@ function App() {
       socket?.close()
       if (requestId === historyRequestId.current) historyRequestId.current += 1
     }
-  }, [active, availableSymbols, currentMarketKey, health.websocketBaseUrl, interval, watchlist])
+  }, [active, currentMarketKey, health.websocketBaseUrl, interval])
 
   useEffect(() => {
     if (!active) return
