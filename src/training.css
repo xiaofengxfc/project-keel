@@ -333,26 +333,27 @@
 }
 
 .training-stop-button {
-  min-height: 42px;
+  min-height: 46px;
   height: auto;
   margin-top: 10px;
-  border: 1px solid #e6b8b4;
+  border: 0;
   border-radius: 10px;
-  background: #fff7f5;
-  color: var(--training-danger);
+  background: var(--training-danger);
+  box-shadow: 0 5px 12px rgba(189, 90, 86, .16);
+  color: #fff;
   font-size: 13px;
   font-weight: 700;
-  transition: background .16s ease, border-color .16s ease;
+  transition: transform .16s ease, background .16s ease, box-shadow .16s ease;
 }
 
 .training-stop-button:hover:not(:disabled) {
-  background: #ffebe7;
-  border-color: #dc928b;
+  transform: translateY(-1px);
+  background: #a94743;
+  box-shadow: 0 8px 17px rgba(189, 90, 86, .2);
 }
 
 .training-stop-button:disabled {
-  opacity: .55;
-  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .training-page-error {
