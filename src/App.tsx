@@ -1459,7 +1459,7 @@ function App() {
             <div><span>止损价格</span><input type="number" min="0" step="any" value={manualStopLoss} onChange={(event) => setManualStopLoss(event.target.value)} placeholder="留空则不设保护" /></div>
             <div><span>止盈价格</span><input type="number" min="0" step="any" value={manualTakeProfit} onChange={(event) => setManualTakeProfit(event.target.value)} placeholder="留空则不设保护" /></div>
           </div>
-            <small className="manual-protection-note">止盈止损可选填写；留空则仅提交订单，不设置保护单。预测模型和 AI 解释层不会自动生成订单价位。</small>
+          <small className="manual-protection-note">止盈止损可选填写；留空则仅提交订单，不设置保护单。预测模型和 AI 解释层不会自动生成订单价位。</small>
           <button className={`submit ${side}`} onClick={submitOrder} disabled={!active || !health.tradingEnabled}>{closePosition ? '提交全平条件单' : `${side === 'buy' ? '买入 / 做多' : '卖出 / 做空'} · ${orderTypeOptions.find((item) => item.value === orderType)?.label}`}</button>
           {activeMinQty && Number(activeMinQty) > 0 && <small className="order-min-note">最小下单数量 {activeMinQty}{isMarketExecution(orderType) ? '（市价）' : ''}</small>}
           {orderMessage && <div className="order-message" role="status">{orderMessage}</div>}
