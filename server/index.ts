@@ -244,30 +244,42 @@ let predictionTrainingProcess: ChildProcess | null = null
 let predictionTrainingStartInFlight = false
 let predictionTrainingStopInFlight = false
 
-async function waitForPidExit(pid: number | undefined, timeoutMs = 10_000): Promise<void> {
-  if (!pid) return
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0)
-    } catch {
-      return
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100))
+function isPidRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM still means the process exists; only ESRCH proves it has exited.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
   }
 }
 
+async function waitForPidExit(pid: number, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!isPidRunning(pid)) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  if (isPidRunning(pid)) throw new Error(`训练进程 ${pid} 在停止信号后仍未退出。`)
+}
+
 async function stopProcessTree(pid: number | undefined): Promise<void> {
-  if (!pid) return
+  if (!pid) throw new Error('找不到训练工作进程，无法停止。')
   if (process.platform !== 'win32') {
     try { process.kill(-pid, 'SIGTERM') } catch { /* The worker may already have exited. */ }
     await waitForPidExit(pid)
     return
   }
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
-    killer.once('error', () => resolve())
-    killer.once('close', () => resolve())
+    killer.once('error', (error) => {
+      if (!isPidRunning(pid)) resolve()
+      else reject(new Error(`无法启动 taskkill：${error.message}`))
+    })
+    killer.once('close', (code) => {
+      if (code === 0 || !isPidRunning(pid)) resolve()
+      else reject(new Error(`taskkill 未能终止训练进程树（退出代码 ${code ?? 'unknown'}）。`))
+    })
   })
   await waitForPidExit(pid)
 }
@@ -474,10 +486,11 @@ app.post<{ Body: { interval?: string; intervals?: string[]; symbolCount?: number
   // Keep the start lock through durable state creation and worker spawn so a
   // concurrent request cannot slip into the small async gap above.
   predictionTrainingStartInFlight = true
-  const pythonPath = process.env.PREDICTION_PYTHON
-    ?? (existsSync(resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'))
-      ? resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
-      : 'python')
+  const configuredPythonPath = process.env.PREDICTION_PYTHON?.trim()
+  const virtualenvPython = resolve('.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  const virtualenvPythonw = resolve('.venv', process.platform === 'win32' ? 'Scripts/pythonw.exe' : 'bin/python')
+  const pythonPath = configuredPythonPath
+    || (process.platform === 'win32' && existsSync(virtualenvPythonw) ? virtualenvPythonw : existsSync(virtualenvPython) ? virtualenvPython : process.platform === 'win32' ? 'pythonw' : 'python')
   const jobId = crypto.randomUUID()
   const progressPath = resolve(dirname(trainingStatePath), 'training-progress.json')
   const initialJob: PredictionTrainingJob = {

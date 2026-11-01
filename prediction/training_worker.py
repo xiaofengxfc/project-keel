@@ -214,6 +214,11 @@ def run_interval(
     atomic_json(state_path, state)
 
     assert process.stdout is not None
+    progress_symbol_index: int | None = None
+    progress_rows_current = 0
+    progress_pages_current = 0
+    progress_rows_completed = 0
+    progress_pages_completed = 0
     for raw_line in process.stdout:
         line = raw_line.rstrip("\r\n")
         if not line:
@@ -233,6 +238,28 @@ def run_interval(
         if not progress:
             progress = load_progress(progress_path, job_id)
         if progress:
+            incoming_symbol_index = progress.get("symbolIndex")
+            if isinstance(incoming_symbol_index, int):
+                if progress_symbol_index is not None and incoming_symbol_index > progress_symbol_index:
+                    progress_rows_completed += progress_rows_current
+                    progress_pages_completed += progress_pages_current
+                    progress_rows_current = 0
+                    progress_pages_current = 0
+                progress_symbol_index = incoming_symbol_index
+            incoming_rows = progress.get("rowsFetched")
+            incoming_pages = progress.get("pagesFetched")
+            if isinstance(incoming_rows, int):
+                if isinstance(incoming_symbol_index, int):
+                    progress_rows_current = max(progress_rows_current, incoming_rows)
+                    progress["rowsFetched"] = progress_rows_completed + progress_rows_current
+                else:
+                    progress["rowsFetched"] = max(state.get("rowsFetched", 0), incoming_rows)
+            if isinstance(incoming_pages, int):
+                if isinstance(incoming_symbol_index, int):
+                    progress_pages_current = max(progress_pages_current, incoming_pages)
+                    progress["pagesFetched"] = progress_pages_completed + progress_pages_current
+                else:
+                    progress["pagesFetched"] = max(state.get("pagesFetched", 0), incoming_pages)
             for field in ("phase", "currentSymbol", "symbolIndex", "symbolCount", "pagesFetched", "rowsFetched", "message"):
                 if field in progress:
                     state[field if field != "phase" else "stage"] = progress[field]

@@ -160,6 +160,30 @@ class TrainingWorkerTests(unittest.TestCase):
             self.assertEqual(state["pagesFetched"], 2)
             self.assertEqual(process_kwargs["env"]["PYTHONIOENCODING"], "utf-8")
 
+    def test_worker_keeps_candle_progress_when_next_symbol_resets_local_counter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            progress_path = root / "progress.json"
+            log_path = root / "training.log"
+            state = {"jobId": "job-1", "intervalResults": {}}
+            lines = [
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 1, "rowsFetched": 100, "pagesFetched": 1}),
+                "KEEL_TRAIN_PROGRESS " + json.dumps({"jobId": "job-1", "phase": "collecting", "symbolIndex": 2, "currentSymbol": "ETHUSDT", "rowsFetched": 0, "pagesFetched": 0}),
+            ]
+
+            class FakeProcess:
+                stdout = iter(f"{line}\n" for line in lines)
+
+                def wait(self):
+                    return 1
+
+            with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
+                run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+
+            self.assertEqual(state["rowsFetched"], 100)
+            self.assertEqual(state["pagesFetched"], 1)
+
     def test_only_local_prediction_endpoints_are_reloaded(self):
         self.assertEqual(local_reload_url("http://127.0.0.1:8790/predict"), "http://127.0.0.1:8790/reload")
         self.assertIsNone(local_reload_url("https://prediction.example/predict"))
