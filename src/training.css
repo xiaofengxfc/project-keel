@@ -333,6 +333,7 @@
 }
 
 .training-stop-button {
+  width: 100%;
   min-height: 46px;
   height: auto;
   margin-top: 10px;
