@@ -22,6 +22,12 @@ from pathlib import Path
 from .training_progress import report_progress
 
 
+def silent_process_options() -> dict[str, int]:
+    """Prevent collector/trainer subprocesses from opening a console on Windows."""
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return {"creationflags": creation_flags} if creation_flags else {}
+
+
 def metric(metadata: dict, name: str, default: float) -> float:
     value = metadata.get("metrics", {}).get(name, default)
     return float(value) if isinstance(value, (int, float)) else default
@@ -79,7 +85,7 @@ def run_module(module: str, args: list[str], extra_env: dict[str, str] | None = 
     if extra_env:
         environment.update(extra_env)
     try:
-        subprocess.run(command, check=True, env=environment)
+        subprocess.run(command, check=True, env=environment, **silent_process_options())
     except subprocess.CalledProcessError as error:
         report_progress("failed", error=f"{module} 子进程退出，代码 {error.returncode}", failedModule=module, message=f"{module} 执行失败")
         raise

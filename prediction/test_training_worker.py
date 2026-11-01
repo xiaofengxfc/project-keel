@@ -1,15 +1,22 @@
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from prediction.training_worker import atomic_json, final_job_phase, is_not_promoted, local_reload_url, load_progress, main, record_worker_failure, run_interval, short_error
+from prediction.training_worker import atomic_json, final_job_phase, is_not_promoted, local_reload_url, load_progress, main, record_worker_failure, run_interval, short_error, silent_process_options
 
 
 class TrainingWorkerTests(unittest.TestCase):
+    def test_silent_process_options_uses_windows_no_console_flag(self):
+        with patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            self.assertEqual(silent_process_options(), {"creationflags": 0x08000000})
+        with patch.object(subprocess, "CREATE_NO_WINDOW", 0, create=True):
+            self.assertEqual(silent_process_options(), {})
+
     def test_atomic_json_retries_transient_windows_replace_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"

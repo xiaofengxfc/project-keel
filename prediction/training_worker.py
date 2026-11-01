@@ -24,6 +24,12 @@ SUPPORTED_INTERVALS = {"15m", "1h", "4h", "1d"}
 ATOMIC_REPLACE_ATTEMPTS = 4
 
 
+def silent_process_options() -> dict[str, int]:
+    """Prevent Python child processes from opening a console on Windows."""
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return {"creationflags": creation_flags} if creation_flags else {}
+
+
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -195,7 +201,7 @@ def run_interval(
     command = [sys.executable, "-u", "-m", "prediction.auto_train", "--symbols", ",".join(symbols), "--interval", interval]
     output_lines: list[str] = []
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=environment)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=environment, **silent_process_options())
     except OSError as error:
         result.update({"phase": "failed", "error": f"无法启动周期训练脚本：{error}", "finishedAt": int(time.time() * 1000)})
         state["stage"] = "failed"

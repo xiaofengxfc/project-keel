@@ -1,9 +1,17 @@
 import unittest
+import subprocess
+from unittest.mock import patch
 
-from prediction.auto_train import candidate_status
+from prediction.auto_train import candidate_status, silent_process_options
 
 
 class AutoTrainPromotionTests(unittest.TestCase):
+    def test_silent_process_options_uses_windows_no_console_flag(self):
+        with patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            self.assertEqual(silent_process_options(), {"creationflags": 0x08000000})
+        with patch.object(subprocess, "CREATE_NO_WINDOW", 0, create=True):
+            self.assertEqual(silent_process_options(), {})
+
     def setUp(self):
         self.candidate = {
             "featureNames": ["return_1", "return_3"],
