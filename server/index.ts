@@ -239,6 +239,7 @@ type PredictionTrainingJob = {
 }
 const trainingStatePath = resolve(process.env.PREDICTION_TRAINING_STATE_FILE ?? 'prediction/validation/training-state.json')
 const trainingLogPath = resolve(process.env.PREDICTION_TRAINING_LOG_FILE ?? 'prediction/validation/training.log')
+const trainingProgressPath = resolve(dirname(trainingStatePath), 'training-progress.json')
 let predictionTrainingJob: PredictionTrainingJob = { jobId: null, running: false, phase: 'idle', output: '', error: null, startedAt: null, finishedAt: null }
 let predictionTrainingProcess: ChildProcess | null = null
 let predictionTrainingStartInFlight = false
@@ -292,10 +293,32 @@ async function persistPredictionTrainingJob(job: PredictionTrainingJob) {
   predictionTrainingJob = job
 }
 
+async function mergePredictionTrainingProgress(job: PredictionTrainingJob): Promise<PredictionTrainingJob> {
+  if (!job.jobId) return job
+  try {
+    const progress = JSON.parse(await readFile(trainingProgressPath, 'utf8')) as Record<string, unknown>
+    if (!progress || progress.jobId !== job.jobId) return job
+    const merged = { ...job }
+    if (job.running) {
+      if (typeof progress.phase === 'string') merged.stage = progress.phase
+      if (typeof progress.interval === 'string') merged.currentInterval = progress.interval
+      if (typeof progress.currentSymbol === 'string') merged.currentSymbol = progress.currentSymbol
+      if (typeof progress.symbolIndex === 'number') merged.symbolIndex = progress.symbolIndex
+      if (typeof progress.symbolCount === 'number') merged.symbolCount = progress.symbolCount
+    }
+    if (typeof progress.pagesFetched === 'number') merged.pagesFetched = Math.max(job.pagesFetched ?? 0, progress.pagesFetched)
+    if (typeof progress.rowsFetched === 'number') merged.rowsFetched = Math.max(job.rowsFetched ?? 0, progress.rowsFetched)
+    return merged
+  } catch {
+    return job
+  }
+}
+
 async function readPredictionTrainingJob(): Promise<PredictionTrainingJob> {
   try {
-    const value = JSON.parse(await readFile(trainingStatePath, 'utf8')) as PredictionTrainingJob
+    let value = JSON.parse(await readFile(trainingStatePath, 'utf8')) as PredictionTrainingJob
     if (!value || typeof value !== 'object' || typeof value.running !== 'boolean' || !['idle', 'running', 'partial', 'completed', 'not-promoted', 'failed', 'stopped'].includes(value.phase)) throw new Error('训练状态文件格式无效')
+    value = await mergePredictionTrainingProgress(value)
     if (value.running && predictionTrainingProcess === null && !predictionTrainingStopInFlight) {
       let alive = false
       if (value.workerPid && Number.isInteger(value.workerPid)) {
