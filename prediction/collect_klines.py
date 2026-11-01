@@ -23,6 +23,7 @@ from .training_progress import report_progress
 
 
 INTERVAL_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+ATOMIC_REPLACE_ATTEMPTS = 8
 
 
 def fetch_page(base_url: str, symbol: str, interval: str, end_time: int | None, retries: int = 3) -> list[list[object]]:
@@ -111,7 +112,14 @@ def main() -> None:
                 writer.writerow(row[:6])
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(checkpoint, output_path)
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(checkpoint, output_path)
+                break
+            except PermissionError:
+                if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(0.1 * (2**attempt))
 
     symbol_index = int(os.getenv("PREDICTION_TRAINING_SYMBOL_INDEX", "0") or 0)
     symbol_count = int(os.getenv("PREDICTION_TRAINING_SYMBOL_COUNT", "0") or 0)

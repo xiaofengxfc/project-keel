@@ -219,6 +219,7 @@ def run_interval(
     progress_pages_current = 0
     progress_rows_completed = 0
     progress_pages_completed = 0
+    last_progress_error: str | None = None
     for raw_line in process.stdout:
         line = raw_line.rstrip("\r\n")
         if not line:
@@ -238,6 +239,11 @@ def run_interval(
         if not progress:
             progress = load_progress(progress_path, job_id)
         if progress:
+            if progress.get("phase") == "failed":
+                if isinstance(progress.get("error"), str) and progress["error"].strip():
+                    last_progress_error = progress["error"].strip()
+            elif progress.get("phase") in {"collecting", "training", "validating", "promoting"}:
+                last_progress_error = None
             incoming_symbol_index = progress.get("symbolIndex")
             if isinstance(incoming_symbol_index, int):
                 if progress_symbol_index is not None and incoming_symbol_index > progress_symbol_index:
@@ -272,7 +278,7 @@ def run_interval(
     output = "\n".join(output_lines)
     if return_code != 0:
         phase = "not-promoted" if is_not_promoted(return_code, output) else "failed"
-        error = short_error(output, return_code)
+        error = last_progress_error or short_error(output, return_code)
         result.update({"phase": phase, "error": error, "finishedAt": int(time.time() * 1000)})
         state["stage"] = phase
         state["currentSymbol"] = None

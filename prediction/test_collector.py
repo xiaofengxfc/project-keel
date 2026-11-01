@@ -1,5 +1,6 @@
 import csv
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -42,6 +43,27 @@ class CollectorTests(unittest.TestCase):
             with path.open("r", newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1000)
+
+    def test_checkpoint_replace_retries_a_transient_windows_file_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "BTCUSDT-1h.csv"
+            page = [candle(3_600_000)]
+            real_replace = os.replace
+            attempts = 0
+
+            def replace_with_transient_lock(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise PermissionError(32, "file is in use")
+                real_replace(source, destination)
+
+            with patch("sys.argv", ["collect_klines", "--symbol", "BTCUSDT", "--interval", "1h", "--output", str(path), "--start-time", "1", "--end-time", str(3_600_000)]), patch("prediction.collect_klines.fetch_page", return_value=page), patch("prediction.collect_klines.os.replace", side_effect=replace_with_transient_lock), patch("prediction.collect_klines.time.sleep"):
+                main()
+
+            self.assertGreaterEqual(attempts, 2)
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 1)
 
     def test_incomplete_existing_file_fills_missing_older_history_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:

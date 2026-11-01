@@ -13,10 +13,12 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from .training_progress import report_progress
@@ -26,6 +28,16 @@ def silent_process_options() -> dict[str, int]:
     """Prevent collector/trainer subprocesses from opening a console on Windows."""
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return {"creationflags": creation_flags} if creation_flags else {}
+
+
+def module_python_executable() -> str:
+    """Use the console interpreter for captured module output, hidden on Windows."""
+    executable = Path(sys.executable)
+    if os.name == "nt" and executable.name.lower() == "pythonw.exe":
+        console_executable = executable.with_name("python.exe")
+        if console_executable.is_file():
+            return str(console_executable)
+    return sys.executable
 
 
 def metric(metadata: dict, name: str, default: float) -> float:
@@ -80,15 +92,82 @@ def candidate_status(candidate: dict, current: dict | None, min_test_samples: in
 
 
 def run_module(module: str, args: list[str], extra_env: dict[str, str] | None = None) -> None:
-    command = [sys.executable, "-m", module, *args]
+    command = [module_python_executable(), "-m", module, *args]
     environment = os.environ.copy()
     if extra_env:
         environment.update(extra_env)
     try:
-        subprocess.run(command, check=True, env=environment, **silent_process_options())
-    except subprocess.CalledProcessError as error:
-        report_progress("failed", error=f"{module} 子进程退出，代码 {error.returncode}", failedModule=module, message=f"{module} 执行失败")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=environment,
+            **silent_process_options(),
+        )
+    except OSError as error:
+        report_progress("failed", error=f"无法启动 {module} 子进程：{error}", failedModule=module, message=f"{module} 启动失败")
         raise
+
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        output_lines.append(line)
+        print(line, end="", flush=True)
+    return_code = process.wait()
+    output = "".join(output_lines)
+    if return_code:
+        clean_output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+        lines = [line.strip() for line in clean_output.splitlines() if line.strip()]
+        detail = next(
+            (
+                line
+                for line in reversed(lines)
+                if re.match(r"^[\w.]+(?:Error|Exception|Interrupt)\s*:", line)
+                and not line.startswith("subprocess.CalledProcessError:")
+            ),
+            next((line for line in reversed(lines) if not line.startswith("KEEL_TRAIN_PROGRESS")), f"退出代码 {return_code}"),
+        )
+        error = f"{module} 子进程退出，代码 {return_code}：{detail[-500:]}"
+        report_progress(
+            "failed",
+            error=error,
+            failedModule=module,
+            message=f"{module} 执行失败",
+        )
+        raise subprocess.CalledProcessError(return_code, command, output=output)
+
+
+def run_collector(symbol: str, interval: str, start_time: int, output_path: Path, symbol_index: int, symbol_count: int) -> None:
+    """Retry the resumable collector after transient network or file-lock errors."""
+    command_args = [
+        "--symbol", symbol, "--interval", interval,
+        "--start-time", str(start_time),
+        "--output", str(output_path),
+    ]
+    environment = {
+        "PREDICTION_TRAINING_SYMBOL_INDEX": str(symbol_index),
+        "PREDICTION_TRAINING_SYMBOL_COUNT": str(symbol_count),
+    }
+    for attempt in range(3):
+        try:
+            run_module("prediction.collect_klines", command_args, environment)
+            return
+        except subprocess.CalledProcessError:
+            if attempt >= 2:
+                raise
+            report_progress(
+                "collecting",
+                interval=interval,
+                currentSymbol=symbol,
+                symbolIndex=symbol_index,
+                symbolCount=symbol_count,
+                message=f"{symbol} 采集暂时失败，正在重试（{attempt + 2}/3）",
+            )
+            time.sleep(float(attempt + 1))
 
 
 def main() -> None:
@@ -115,11 +194,7 @@ def main() -> None:
     for index, symbol in enumerate(symbols, start=1):
         output_path = args.data_dir / f"{symbol}-{args.interval}.csv"
         report_progress("collecting", interval=args.interval, currentSymbol=symbol, symbolIndex=index, symbolCount=len(symbols), pagesFetched=0, rowsFetched=0, message=f"正在检查并更新 {symbol} 历史 K 线")
-        run_module("prediction.collect_klines", [
-            "--symbol", symbol, "--interval", args.interval,
-            "--start-time", str(args.start_time),
-            "--output", str(output_path),
-        ], {"PREDICTION_TRAINING_SYMBOL_INDEX": str(index), "PREDICTION_TRAINING_SYMBOL_COUNT": str(len(symbols))})
+        run_collector(symbol, args.interval, args.start_time, output_path, index, len(symbols))
         input_paths.append(str(output_path))
 
     with tempfile.TemporaryDirectory(prefix="keel-model-") as temporary:

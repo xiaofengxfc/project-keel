@@ -184,6 +184,61 @@ class TrainingWorkerTests(unittest.TestCase):
             self.assertEqual(state["rowsFetched"], 100)
             self.assertEqual(state["pagesFetched"], 1)
 
+    def test_worker_preserves_machine_readable_child_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            progress_path = root / "progress.json"
+            log_path = root / "training.log"
+            state = {"jobId": "job-1", "intervalResults": {}}
+
+            class FakeProcess:
+                stdout = iter([
+                    "KEEL_TRAIN_PROGRESS " + json.dumps({
+                        "jobId": "job-1",
+                        "phase": "failed",
+                        "error": "prediction.collect_klines 子进程退出，代码 1：RuntimeError: Binance K 线请求失败",
+                    }) + "\n",
+                ])
+
+                def wait(self):
+                    return 1
+
+            with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
+                result = run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+
+            self.assertEqual(result["phase"], "failed")
+            self.assertIn("Binance K 线请求失败", result["error"])
+
+    def test_worker_clears_stale_progress_error_after_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            progress_path = root / "progress.json"
+            log_path = root / "training.log"
+            state = {"jobId": "job-1", "intervalResults": {}}
+
+            class FakeProcess:
+                stdout = iter([
+                    "KEEL_TRAIN_PROGRESS " + json.dumps({
+                        "jobId": "job-1", "phase": "failed",
+                        "error": "第一次采集失败",
+                    }) + "\n",
+                    "KEEL_TRAIN_PROGRESS " + json.dumps({
+                        "jobId": "job-1", "phase": "collecting",
+                    }) + "\n",
+                    "RuntimeError: 第二次采集失败\n",
+                ])
+
+                def wait(self):
+                    return 1
+
+            with patch("prediction.training_worker.subprocess.Popen", return_value=FakeProcess()):
+                result = run_interval("15m", ["BTCUSDT", "ETHUSDT"], "job-1", state_path, progress_path, log_path, state)
+
+            self.assertIn("第二次采集失败", result["error"])
+            self.assertNotIn("第一次采集失败", result["error"])
+
     def test_only_local_prediction_endpoints_are_reloaded(self):
         self.assertEqual(local_reload_url("http://127.0.0.1:8790/predict"), "http://127.0.0.1:8790/reload")
         self.assertIsNone(local_reload_url("https://prediction.example/predict"))
